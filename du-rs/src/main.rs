@@ -4,7 +4,7 @@
 use nix::fcntl::OFlag;
 use nix::{sys::stat::Mode, *};
 use std::clone;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::{env, error::Error, result};
@@ -114,40 +114,39 @@ fn calculate_total_dir_size(dir: &Path) -> u64 {
 //    }
 //}
 
-fn scan_directory_iter(dir: &Path) -> HashMap<PathBuf, String> {
-    let mut dir_stack = vec![dir.to_path_buf()];
-    let mut results = Vec::new();
-    let mut hashmap = HashMap::new();
-    while let Some(d_path) = dir_stack.pop() {
+fn scan_directory_iter(root_dir: &Path) -> BTreeMap<PathBuf, Vec<PathBuf>> {
+    let mut dir_stack = VecDeque::new();
+    let mut dir_map = BTreeMap::new();
+    dir_stack.push_back(root_dir.to_path_buf());
+    while let Some(d_path) = dir_stack.pop_front() {
         let open_dir = nix::dir::Dir::open(&d_path, OFlag::O_RDONLY, Mode::empty()).unwrap();
+        let mut files = Vec::new();
         for res in open_dir {
             match res {
                 Ok(entry) => {
                     let file_name = entry.file_name().to_string_lossy();
-                    if file_name == "." && file_name.len() == 1
-                        || file_name == ".." && file_name.len() == 2
-                    {
+                    if file_name == "." || file_name == ".." {
                         continue;
                     }
                     let full_path = d_path.join(file_name.as_ref());
 
                     match entry.file_type() {
                         Some(nix::dir::Type::Directory) => {
-                            dir_stack.push(full_path.clone());
-                            hashmap.insert(full_path, "dir".to_string());
+                            dir_stack.push_back(full_path.clone());
+                            dir_map.entry(d_path.clone()).or_insert_with(Vec::new);
                         }
                         Some(nix::dir::Type::File) => {
-                            results.push(full_path.clone());
-                            hashmap.insert(full_path, "file".to_string());
+                            files.push(full_path);
                         }
-                        _ => println!("wth is this? {:?}", full_path),
-                    };
+                        _ => {}
+                    }
                 }
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
+        dir_map.insert(d_path, files);
     }
-    hashmap
+    dir_map
 }
 fn main() {
     let current_dir = env::current_dir().unwrap();
@@ -184,13 +183,33 @@ fn main() {
     //}
     //
     //scan_directory_recursive(&current_dir);
-    let output = scan_directory_iter(&current_dir);
-    for (path, file_type) in output {
-        let file_size = get_file_size_in_bytes(path.clone());
-        let dir_path;
-        if file_type == "dir" {
-            dir_path = path.clone();
-            println!(".{:?}", path.clone());
+    //    let output = scan_directory_iter(&current_dir);
+    //println!("{:?}", output);
+    //for (path, file_type) in output {
+    //    let file_size = get_file_size_in_bytes(path.clone());
+    //    let dir_path;
+    //    if file_type == "dir" {
+    //        dir_path = path.clone();
+    //        let c = current_dir.to_string_lossy().into_owned();
+    //        let d = dir_path.strip_prefix(c);
+    //        //println!(".{:?}", d);
+    //    }
+    //}
+    let dir_map = scan_directory_iter(&current_dir);
+    let base_path = current_dir;
+
+    for (dir, files) in &dir_map {
+        for file in files {
+            let file_path = file.as_path();
+            let file_size = get_file_size_in_bytes(file_path.to_owned());
+            let relative_path = file_path
+                .strip_prefix(base_path.clone())
+                .unwrap_or(file_path);
+            println!("{}     ./{}", file_size, relative_path.display());
         }
+
+        let dir_size = get_file_size_in_bytes(dir.to_owned());
+        let relative_dir = dir.strip_prefix(base_path.clone()).unwrap_or(dir);
+        println!("     ./{}", relative_dir.display());
     }
 }
