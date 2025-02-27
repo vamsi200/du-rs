@@ -39,32 +39,45 @@ type MyResult<T> = result::Result<T, Box<dyn Error>>;
 //    output
 //}
 
-fn get_file_size_in_bytes(file_path: PathBuf) -> i64 {
+fn get_file_size_in_bytes(file_path: &PathBuf) -> i64 {
     //Returns file size in bytes
-    if let Ok(res) = nix::sys::stat::stat(&file_path) {
+    if let Ok(res) = nix::sys::stat::stat(file_path) {
         res.st_size
     } else {
         0
     }
 }
+struct FileSize {
+    bytes: i64,
+    formatted: String,
+}
 
-fn get_file_size(file_path: &Path) -> String {
-    //Returns file size in human readable format
-    if let Ok(res) = nix::sys::stat::stat(file_path) {
-        let bytes = res.st_blocks * 512;
-        if bytes < 1024 {
-            format!("{}", bytes)
-        } else if bytes >= 1024 && bytes < 1048576 {
-            format!("{:.1}K", bytes as f64 / 1024.0)
-        } else if bytes >= 1048576 && bytes < 1073741824 {
-            format!("{:.1}M", bytes as f64 / 1048576.0)
+fn get_file_size(file_path: Option<&Path>, bytes: Option<i64>) -> FileSize {
+    let bytes = if let Some(f) = file_path {
+        if let Ok(res) = nix::sys::stat::stat(f) {
+            Some(res.st_blocks * 512)
         } else {
-            format!("{:.1}G", bytes as f64 / 1073741824.0)
+            None
         }
     } else {
-        0.to_string()
-    }
+        bytes
+    };
+
+    let bytes = bytes.unwrap_or(0);
+
+    let formatted = if bytes < 1024 {
+        format!("{}B", bytes)
+    } else if bytes < 1048576 {
+        format!("{:.1}K", bytes as f64 / 1024.0)
+    } else if bytes < 1073741824 {
+        format!("{:.1}M", bytes as f64 / 1048576.0)
+    } else {
+        format!("{:.1}G", bytes as f64 / 1073741824.0)
+    };
+
+    FileSize { bytes, formatted }
 }
+
 fn format_file_size(file_path: &Path, arg: String) -> MyResult<String> {
     //Returns file size based on argument given
     if let Ok(res) = nix::sys::stat::stat(file_path) {
@@ -100,8 +113,36 @@ fn count_files(dir: &Path) -> u64 {
     todo!()
 }
 
-fn calculate_total_dir_size(dir: &Path) -> u64 {
-    todo!()
+fn calculate_total_dir_size(dir: BTreeMap<PathBuf, Vec<PathBuf>>) {
+    let mut total: i64 = 0;
+    let mut summarize_size: i64 = 0;
+    let current_dir = env::current_dir().unwrap();
+    for (dir_path, files) in dir.clone() {
+        match dir.get(&dir_path) {
+            Some(d) => {
+                for file in d {
+                    let fb = get_file_size(Some(file), None);
+                    let bytes = fb.bytes;
+                    let f_bytes = fb.formatted;
+                    let stripped_file = file
+                        .strip_prefix(current_dir.clone())
+                        .unwrap_or(file)
+                        .to_path_buf();
+                    println!("{:<10}./{}", f_bytes, stripped_file.display());
+                    total += bytes;
+                }
+            }
+            None => println!("wut?"),
+        }
+        let total_dir_formatted = get_file_size(None, Some(total));
+        let tdf = total_dir_formatted.formatted;
+        summarize_size += total_dir_formatted.bytes;
+
+        println!("{:<10}{}", tdf, dir_path.display());
+    }
+    let something = get_file_size(None, Some(summarize_size));
+    let s = something.formatted;
+    println!("Entirety : {}", s);
 }
 
 //fn scan_directory_recursive(dir: &Path) {
@@ -114,12 +155,20 @@ fn calculate_total_dir_size(dir: &Path) -> u64 {
 //    }
 //}
 
-fn scan_directory_iter(root_dir: &Path) -> BTreeMap<PathBuf, Vec<PathBuf>> {
+fn scan_directory_iter(root_dir: &Path, max_depth: i32) -> BTreeMap<PathBuf, Vec<PathBuf>> {
     let mut dir_stack = VecDeque::new();
     let mut dir_map = BTreeMap::new();
-    dir_stack.push_back(root_dir.to_path_buf());
-    while let Some(d_path) = dir_stack.pop_front() {
-        let open_dir = nix::dir::Dir::open(&d_path, OFlag::O_RDONLY, Mode::empty()).unwrap();
+    let no_depth = max_depth == 0;
+    dir_stack.push_back((root_dir.to_path_buf(), 0));
+    while let Some((d_path, depth)) = dir_stack.pop_front() {
+        let open_dir = match nix::dir::Dir::open(&d_path, OFlag::O_RDONLY, Mode::empty()) {
+            Ok(dir) => dir,
+            Err(e) => {
+                //log to a file?
+                eprintln!("Failed to open {:?}: {}", d_path, e);
+                continue;
+            }
+        };
         let mut files = Vec::new();
         for res in open_dir {
             match res {
@@ -132,7 +181,13 @@ fn scan_directory_iter(root_dir: &Path) -> BTreeMap<PathBuf, Vec<PathBuf>> {
 
                     match entry.file_type() {
                         Some(nix::dir::Type::Directory) => {
-                            dir_stack.push_back(full_path.clone());
+                            //when zero given f the checks..and proceed to push everything, ie.
+                            //no_depth becomes true and so the other condition.
+                            //if some value given then no_depth becomes false and now it depends on
+                            //other check.. so it will push it until depth < max_depth.
+                            if no_depth || depth < max_depth {
+                                dir_stack.push_back((full_path.clone(), depth + 1));
+                            }
                             dir_map.entry(d_path.clone()).or_insert_with(Vec::new);
                         }
                         Some(nix::dir::Type::File) => {
@@ -141,13 +196,14 @@ fn scan_directory_iter(root_dir: &Path) -> BTreeMap<PathBuf, Vec<PathBuf>> {
                         _ => {}
                     }
                 }
-                Err(e) => eprintln!("Error: {}", e),
+                Err(e) => eprintln!("Error reading directory {:?}: {}", d_path, e),
             }
         }
         dir_map.insert(d_path, files);
     }
     dir_map
 }
+
 fn main() {
     let current_dir = env::current_dir().unwrap();
     //let output = nix::dir::Dir::open(&current_dir, OFlag::O_RDONLY, Mode::empty()).unwrap();
@@ -195,21 +251,21 @@ fn main() {
     //        //println!(".{:?}", d);
     //    }
     //}
-    let dir_map = scan_directory_iter(&current_dir);
-    let base_path = current_dir;
-
-    for (dir, files) in &dir_map {
-        for file in files {
-            let file_path = file.as_path();
-            let file_size = get_file_size_in_bytes(file_path.to_owned());
-            let relative_path = file_path
-                .strip_prefix(base_path.clone())
-                .unwrap_or(file_path);
-            println!("{}     ./{}", file_size, relative_path.display());
-        }
-
-        let dir_size = get_file_size_in_bytes(dir.to_owned());
-        let relative_dir = dir.strip_prefix(base_path.clone()).unwrap_or(dir);
-        println!("     ./{}", relative_dir.display());
-    }
+    let dir_map = scan_directory_iter(&current_dir, 0);
+    calculate_total_dir_size(dir_map.clone());
+    //let base_path = current_dir;
+    //for (dir, files) in &dir_map {
+    //    for file in files {
+    //        let file_path = file.as_path();
+    //        let file_size = get_file_size_in_bytes(file_path.to_owned());
+    //        let relative_path = file_path
+    //            .strip_prefix(base_path.clone())
+    //            .unwrap_or(file_path);
+    //        println!("{:<10}./{}", file_size, relative_path.display());
+    //    }
+    //
+    //    let dir_size = get_file_size_in_bytes(dir.to_owned());
+    //    let relative_dir = dir.strip_prefix(base_path.clone()).unwrap_or(dir);
+    //    println!("{:<10}./{}", dir_size, relative_dir.display());
+    //}
 }
