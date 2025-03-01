@@ -148,6 +148,7 @@ struct Args {
     threshold: Option<u64>,
     x: Option<PathBuf>,
     xclude: Option<PathBuf>,
+    a: bool,
 }
 
 fn handle_args() -> Args {
@@ -162,10 +163,19 @@ fn handle_args() -> Args {
     let mut threshold = None;
     let mut x = None;
     let mut xclude = None;
-
+    let mut a = false;
     while let Some(arg) = arguments.next() {
         match arg.as_str() {
             "-h" | "--human_readable" => human_readable = true,
+            "-sh" => {
+                human_readable = true;
+                summarize = true;
+            }
+            "-a" | "-all" => a = true,
+            "-ah" => {
+                a = true;
+                human_readable = true;
+            }
             "-b" => bytes = true,
             "-s" | "--summarize" => summarize = true,
             "-c" | "--total" => total = true,
@@ -206,23 +216,26 @@ fn handle_args() -> Args {
         threshold,
         xclude,
         x,
+        a,
     }
 }
 
 fn scan_directory_iter(root_dir: &Path, max_depth: i32) -> BTreeMap<PathBuf, Vec<PathBuf>> {
+    let current_dir = env::current_dir().unwrap();
     let mut dir_stack = VecDeque::new();
     let mut dir_map = BTreeMap::new();
     let no_depth = max_depth == 0;
     dir_stack.push_back((root_dir.to_path_buf(), 0));
+
     while let Some((d_path, depth)) = dir_stack.pop_front() {
         let open_dir = match nix::dir::Dir::open(&d_path, OFlag::O_RDONLY, Mode::empty()) {
             Ok(dir) => dir,
             Err(e) => {
-                //log to a file?
                 eprintln!("Failed to open {:?}: {}", d_path, e);
                 continue;
             }
         };
+
         let mut files = Vec::new();
         for res in open_dir {
             match res {
@@ -231,8 +244,7 @@ fn scan_directory_iter(root_dir: &Path, max_depth: i32) -> BTreeMap<PathBuf, Vec
                     if file_name == "." || file_name == ".." {
                         continue;
                     }
-                    let full_path = d_path.join(file_name.as_ref());
-
+                    let full_path = d_path.join(&*file_name);
                     match entry.file_type() {
                         Some(nix::dir::Type::Directory) => {
                             //when zero given f the checks..and proceed to push everything, ie.
@@ -242,7 +254,11 @@ fn scan_directory_iter(root_dir: &Path, max_depth: i32) -> BTreeMap<PathBuf, Vec
                             if no_depth || depth < max_depth {
                                 dir_stack.push_back((full_path.clone(), depth + 1));
                             }
-                            dir_map.entry(d_path.clone()).or_insert_with(Vec::new);
+                            let relative_dir = full_path
+                                .strip_prefix(&current_dir)
+                                .unwrap_or(&full_path)
+                                .to_path_buf();
+                            dir_map.insert(PathBuf::from("./").join(relative_dir), Vec::new());
                         }
                         Some(nix::dir::Type::File) => {
                             files.push(full_path);
@@ -253,105 +269,46 @@ fn scan_directory_iter(root_dir: &Path, max_depth: i32) -> BTreeMap<PathBuf, Vec
                 Err(e) => eprintln!("Error reading directory {:?}: {}", d_path, e),
             }
         }
-        dir_map.insert(d_path, files);
+
+        let relative_d_path = d_path
+            .strip_prefix(&current_dir)
+            .unwrap_or(&d_path)
+            .to_path_buf();
+        let dir_key = PathBuf::from("./").join(relative_d_path);
+        dir_map.insert(dir_key, files);
     }
     dir_map
 }
-
-fn main() {
-    let current_dir = env::current_dir().unwrap();
-    //let output = nix::dir::Dir::open(&current_dir, OFlag::O_RDONLY, Mode::empty()).unwrap();
-    //for res in output {
-    //    match res {
-    //        Ok(e) => {
-    //            println!("{}, inode: {}", e.file_name().to_string_lossy(), e.ino());
-    //            match e.file_type() {
-    //                Some(file) => {
-    //                    println!("This is a: {:?}", file);
-    //                }
-    //                None => println!("wth is this!"),
-    //            }
-    //        }
-    //        Err(e) => eprintln!("Error {}", e),
-    //    }
-    //}
-
-    //let mut output = scan_directory(&current_dir);
-    //
-    //for (path, file_type) in output {
-    //    if file_type == "file" {
-    //        let file_size = get_file_size_in_bytes(&path);
-    //        println!(
-    //            "filename: {:?} filesize: {file_size} bytes",
-    //            path.file_name()
-    //        );
-    //        let human_readable_size = get_file_size(&path);
-    //        println!("{human_readable_size}");
-    //        let output = format_file_size(&path, "BQ".to_string());
-    //        println!("{:?}", output);
-    //    }
-    //}
-    //
-    //scan_directory_recursive(&current_dir);
-    //    let output = scan_directory_iter(&current_dir);
-    //println!("{:?}", output);
-    //for (path, file_type) in output {
-    //    let file_size = get_file_size_in_bytes(path.clone());
-    //    let dir_path;
-    //    if file_type == "dir" {
-    //        dir_path = path.clone();
-    //        let c = current_dir.to_string_lossy().into_owned();
-    //        let d = dir_path.strip_prefix(c);
-    //        //println!(".{:?}", d);
-    //    }
-    //}
+fn main() -> MyResult<()> {
     let g_args = handle_args();
-    let dir_map = scan_directory_iter(&current_dir, 0);
-    //match g_args.depth {
-    //    Some(a) => {
-    //        dir_map = scan_directory_iter(&current_dir, a);
-    //        calculate_total_dir_size(dir_map.clone(), true);
-    //    }
-    //    None => {}
-    //}
-    //calculate_total_dir_size(dir_map.clone(), true);
-    //
-    //match g_args.block_size {
-    //    Some(s) => {
-    //        let out = format_file_size(&dir_map, s.as_str());
-    //        match out {
-    //            Ok(s) => println!("{s}"),
-    //            Err(e) => eprintln!("{}", e),
-    //        }
-    //    }
-    //    None => {}
-    //}
-    let out = calculate_total_dir_size(&dir_map.clone(), g_args.human_readable, |l| {
-        if !g_args.summarize {
-            println!("{}", l);
-        }
-    });
+    let base_dir = &g_args.path;
+    let depth = g_args.depth.unwrap_or(0);
+    let dir_map = scan_directory_iter(base_dir, depth);
 
-    if g_args.summarize && g_args.human_readable {
-        let output = get_file_size(None, Some(out));
-        println!("{:<10} .", output.formatted);
+    // If summarize is set, we skip printing individual file sizes
+    if !g_args.summarize {
+        let total_size = calculate_total_dir_size(&dir_map, g_args.human_readable, |l| {
+            if g_args.a || depth != -1 {
+                println!("{}", l);
+            }
+        });
+
+        let output = get_file_size(None, Some(total_size));
+        if g_args.human_readable {
+            println!("{:<10} .", output.formatted);
+        } else {
+            println!("{:<10} .", total_size);
+        }
     } else {
-        println!("{:<10} .", out);
+        let total_size = calculate_total_dir_size(&dir_map, g_args.human_readable, |_| {});
+
+        let output = get_file_size(None, Some(total_size));
+        if g_args.human_readable {
+            println!("{:<10} .", output.formatted);
+        } else {
+            println!("{:<10} .", total_size);
+        }
     }
 
-    //let base_path = current_dir;
-    //for (dir, files) in &dir_map {
-    //    for file in files {
-    //        let file_path = file.as_path();
-    //        let file_size = get_file_size_in_bytes(file_path.to_owned());
-    //        let relative_path = file_path
-    //            .strip_prefix(base_path.clone())
-    //            .unwrap_or(file_path);
-    //        println!("{:<10}./{}", file_size, relative_path.display());
-    //    }
-    //
-    //    let dir_size = get_file_size_in_bytes(dir.to_owned());
-    //    let relative_dir = dir.strip_prefix(base_path.clone()).unwrap_or(dir);
-    //    println!("{:<10}./{}", dir_size, relative_dir.display());
-    //}
+    Ok(())
 }
