@@ -1,12 +1,14 @@
 #![allow(unused_imports)]
 #![allow(dead_code)]
 #![allow(unused_variables)]
+use getopts::Options;
 use nix::fcntl::OFlag;
 use nix::{sys::stat::Mode, *};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::env::args;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::process::exit;
 use std::{clone, str};
 use std::{env, error::Error, result};
 
@@ -97,41 +99,32 @@ fn calculate_total_dir_size<F>(
 where
     F: FnMut(&str),
 {
-    let mut summarize_size: i64 = 0;
     let current_dir = env::current_dir().unwrap();
-
-    for (dir_path, files) in dir {
-        let mut dir_total: i64 = 0;
-
-        for file in files {
-            let file_size = get_file_size(Some(file), None);
-            let stripped_file = file.strip_prefix(&current_dir).unwrap_or(file);
+    let summarize_size: i64 = dir
+        .iter()
+        .map(|(dir_path, files)| {
+            let dir_total: i64 = files
+                .iter()
+                .map(|file| {
+                    let full_path = dir_path.join(file);
+                    get_file_size(Some(&full_path), None).bytes
+                })
+                .sum();
 
             let output = if format {
-                format!("{:<10} ./{}", file_size.formatted, stripped_file.display())
+                format!(
+                    "{:<10} {}",
+                    get_file_size(None, Some(dir_total)).formatted,
+                    dir_path.display()
+                )
             } else {
-                format!("{:<10} ./{}", file_size.bytes, stripped_file.display())
+                format!("{:<10} {}", dir_total, dir_path.display())
             };
 
             output_fn(&output);
-            dir_total += file_size.bytes;
-        }
-
-        let total_dir_formatted = get_file_size(None, Some(dir_total));
-
-        let output = if format {
-            format!(
-                "{:<10} {}",
-                total_dir_formatted.formatted,
-                dir_path.display()
-            )
-        } else {
-            format!("{:<10} {}", dir_total, dir_path.display())
-        };
-
-        output_fn(&output);
-        summarize_size += dir_total;
-    }
+            dir_total
+        })
+        .sum();
 
     summarize_size
 }
@@ -151,6 +144,25 @@ struct Args {
     a: bool,
 }
 
+fn print_help() {
+    println!(
+        "Usage: myprogram [OPTIONS] [PATH]
+Options:
+  -h, --help              Show this help message and exit
+  -a, --all               Include hidden files
+  -ah                     Include hidden files and use human-readable sizes
+  -b                      Display sizes in bytes
+  -s, --summarize         Summarize directory sizes
+  -c, --total             Show total size
+  -d, --max-depth DEPTH   Set maximum depth for directory traversal
+  -B<size>                Set block size
+  -t, --threshold VALUE   Set size threshold
+  -x, --one-file-system PATH  Limit scanning to one file system
+  -X, --exclude-from PATH    Exclude paths from a file"
+    );
+    exit(0);
+}
+
 fn handle_args() -> Args {
     let mut arguments = env::args().skip(1);
     let mut path = env::current_dir().unwrap();
@@ -164,47 +176,48 @@ fn handle_args() -> Args {
     let mut x = None;
     let mut xclude = None;
     let mut a = false;
+
     while let Some(arg) = arguments.next() {
         match arg.as_str() {
-            "-h" | "--human_readable" => human_readable = true,
-            "-sh" => {
-                human_readable = true;
-                summarize = true;
-            }
-            "-a" | "-all" => a = true,
+            "-h" | "--help" => print_help(),
+            "-a" | "--all" => a = true,
             "-ah" => {
                 a = true;
                 human_readable = true;
             }
+            "-sh" => {
+                summarize = true;
+                human_readable = true;
+            }
+
             "-b" => bytes = true,
             "-s" | "--summarize" => summarize = true,
             "-c" | "--total" => total = true,
             "-d" | "--max-depth" => {
-                if let Some(val) = arguments.next() {
-                    depth = val.parse::<i32>().ok();
-                }
+                depth = arguments.next().and_then(|v| v.parse().ok());
             }
             _ if arg.starts_with("-B") => {
-                block_size = arg.strip_prefix("-").map(|s| s.to_string());
+                block_size = arg.strip_prefix("-B").map(String::from);
             }
             "-t" | "--threshold" => {
-                if let Some(val) = arguments.next() {
-                    threshold = val.parse::<u64>().ok();
-                }
+                threshold = arguments.next().and_then(|v| v.parse().ok());
             }
             "-x" | "--one-file-system" => {
-                if let Some(val) = arguments.next() {
-                    x = val.parse::<PathBuf>().ok();
-                }
+                x = arguments.next().map(PathBuf::from);
             }
             "-X" | "--exclude-from" => {
-                if let Some(val) = arguments.next() {
-                    xclude = val.parse::<PathBuf>().ok();
-                }
+                xclude = arguments.next().map(PathBuf::from);
             }
-            _ => path = env::current_dir().unwrap(),
+            _ => {
+                if arg.starts_with('-') {
+                    eprintln!("Error: Invalid argument '{}'", arg);
+                    exit(1);
+                }
+                path = PathBuf::from(arg);
+            }
         }
     }
+
     Args {
         depth,
         path,
