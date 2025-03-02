@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 #![allow(dead_code)]
 #![allow(unused_variables)]
-use getopts::Options;
 use nix::fcntl::OFlag;
 use nix::{sys::stat::Mode, *};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -298,7 +297,6 @@ fn main() -> MyResult<()> {
     let depth = g_args.depth.unwrap_or(0);
     let dir_map = scan_directory_iter(base_dir, depth);
 
-    // If summarize is set, we skip printing individual file sizes
     if !g_args.summarize {
         let total_size = calculate_total_dir_size(&dir_map, g_args.human_readable, |l| {
             if g_args.a || depth != -1 {
