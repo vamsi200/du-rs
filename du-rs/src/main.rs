@@ -3,15 +3,17 @@
 #![allow(unused_variables)]
 use nix::fcntl::OFlag;
 use nix::{sys::stat::Mode, *};
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::env::args;
-use std::os::fd::AsRawFd;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::exit;
-use std::{clone, str};
 use std::{env, error::Error, result};
 
-type MyResult<T> = result::Result<T, Box<dyn Error>>;
+type Result<T> = result::Result<T, Box<dyn Error>>;
+
+struct FileSize {
+    bytes: i64,
+    formatted: String,
+}
 
 fn get_file_size_in_bytes(file_path: &PathBuf) -> i64 {
     //Returns file size in bytes
@@ -20,10 +22,6 @@ fn get_file_size_in_bytes(file_path: &PathBuf) -> i64 {
     } else {
         0
     }
-}
-struct FileSize {
-    bytes: i64,
-    formatted: String,
 }
 
 fn get_file_size(file_path: Option<&Path>, bytes: Option<i64>) -> FileSize {
@@ -52,7 +50,7 @@ fn get_file_size(file_path: Option<&Path>, bytes: Option<i64>) -> FileSize {
     FileSize { bytes, formatted }
 }
 
-fn format_file_size(file_map: &BTreeMap<PathBuf, Vec<PathBuf>>, arg: &str) -> MyResult<String> {
+fn format_file_size(file_map: &BTreeMap<PathBuf, Vec<PathBuf>>, arg: &str) -> Result<String> {
     for (dir_path, _files) in file_map {
         let res = nix::sys::stat::stat(dir_path).map_err(|_| "Failed to get file size")?;
         let bytes = res.st_blocks * 512;
@@ -91,58 +89,31 @@ fn count_files(dir: &Path) -> u64 {
 }
 
 fn calculate_total_dir_size<F>(
-    dir: &BTreeMap<PathBuf, Vec<PathBuf>>,
+    dir: &BTreeMap<PathBuf, Vec<i64>>,
     format: bool,
     mut output_fn: F,
 ) -> i64
 where
     F: FnMut(&str),
 {
-    let current_dir = env::current_dir().unwrap();
-    let summarize_size: i64 = dir
-        .iter()
-        .map(|(dir_path, files)| {
-            let dir_total: i64 = files
-                .iter()
-                .map(|file| {
-                    let full_path = dir_path.join(file);
-                    get_file_size(Some(&full_path), None).bytes
-                })
-                .sum();
+    let mut total_size: i64 = 0;
 
-            let output = if format {
-                format!(
-                    "{:<10} {}",
-                    get_file_size(None, Some(dir_total)).formatted,
-                    dir_path.display()
-                )
-            } else {
-                format!("{:<10} {}", dir_total, dir_path.display())
-            };
+    for (dir_path, file_sizes) in dir.iter() {
+        let dir_total: i64 = file_sizes.iter().sum();
+        total_size += dir_total;
 
-            output_fn(&output);
-            dir_total
-        })
-        .sum();
+        let output = if format {
+            let file_size = get_file_size(None, Some(dir_total));
+            format!("{:<10} {}", file_size.formatted, dir_path.display())
+        } else {
+            format!("{:<10} {}", dir_total, dir_path.display())
+        };
 
-    summarize_size
+        output_fn(&output);
+    }
+
+    total_size
 }
-
-#[derive(Debug)]
-struct Args {
-    path: PathBuf,
-    human_readable: bool,
-    depth: Option<i32>,
-    summarize: bool,
-    bytes: bool,
-    total: bool,
-    block_size: Option<String>,
-    threshold: Option<u64>,
-    x: Option<PathBuf>,
-    xclude: Option<PathBuf>,
-    a: bool,
-}
-
 fn print_help() {
     println!(
         "Usage: myprogram [OPTIONS] [PATH]
@@ -162,6 +133,21 @@ Options:
     exit(0);
 }
 
+#[derive(Debug)]
+struct Args {
+    path: PathBuf,
+    human_readable: bool,
+    depth: Option<i32>,
+    summarize: bool,
+    bytes: bool,
+    total: bool,
+    block_size: Option<String>,
+    threshold: Option<u64>,
+    x: Option<PathBuf>,
+    xclude: Option<PathBuf>,
+    a: bool,
+}
+
 fn handle_args() -> Args {
     let mut arguments = env::args().skip(1);
     let mut path = env::current_dir().unwrap();
@@ -178,7 +164,8 @@ fn handle_args() -> Args {
 
     while let Some(arg) = arguments.next() {
         match arg.as_str() {
-            "-h" | "--help" => print_help(),
+            "--help" => print_help(),
+            "-h" | "--human-readable" => human_readable = true,
             "-a" | "--all" => a = true,
             "-ah" => {
                 a = true;
@@ -231,15 +218,15 @@ fn handle_args() -> Args {
         a,
     }
 }
-
-fn scan_directory_iter(root_dir: &Path, max_depth: i32) -> BTreeMap<PathBuf, Vec<PathBuf>> {
+fn scan_directory_iter(root_dir: &Path, max_depth: i32) -> BTreeMap<PathBuf, Vec<i64>> {
     let current_dir = env::current_dir().unwrap();
-    let mut dir_stack = VecDeque::new();
+    let cd = current_dir == root_dir;
+    let mut dir_stack = Vec::new();
     let mut dir_map = BTreeMap::new();
     let no_depth = max_depth == 0;
-    dir_stack.push_back((root_dir.to_path_buf(), 0));
+    dir_stack.push((root_dir.to_path_buf(), 0));
 
-    while let Some((d_path, depth)) = dir_stack.pop_front() {
+    while let Some((d_path, depth)) = dir_stack.pop() {
         let open_dir = match nix::dir::Dir::open(&d_path, OFlag::O_RDONLY, Mode::empty()) {
             Ok(dir) => dir,
             Err(e) => {
@@ -247,8 +234,8 @@ fn scan_directory_iter(root_dir: &Path, max_depth: i32) -> BTreeMap<PathBuf, Vec
                 continue;
             }
         };
-
-        let mut files = Vec::new();
+        let mut file_sizes = Vec::new();
+        let mut sub_dirs = Vec::new();
         for res in open_dir {
             match res {
                 Ok(entry) => {
@@ -259,21 +246,16 @@ fn scan_directory_iter(root_dir: &Path, max_depth: i32) -> BTreeMap<PathBuf, Vec
                     let full_path = d_path.join(&*file_name);
                     match entry.file_type() {
                         Some(nix::dir::Type::Directory) => {
-                            //when zero given f the checks..and proceed to push everything, ie.
-                            //no_depth becomes true and so the other condition.
-                            //if some value given then no_depth becomes false and now it depends on
-                            //other check.. so it will push it until depth < max_depth.
                             if no_depth || depth < max_depth {
-                                dir_stack.push_back((full_path.clone(), depth + 1));
+                                sub_dirs.push((full_path.clone(), depth + 1));
                             }
-                            let relative_dir = full_path
-                                .strip_prefix(&current_dir)
-                                .unwrap_or(&full_path)
-                                .to_path_buf();
-                            dir_map.insert(PathBuf::from("./").join(relative_dir), Vec::new());
                         }
                         Some(nix::dir::Type::File) => {
-                            files.push(full_path);
+                            let size = match nix::sys::stat::stat(&full_path) {
+                                Ok(meta) => meta.st_blocks * 512,
+                                Err(_) => 0,
+                            };
+                            file_sizes.push(size);
                         }
                         _ => {}
                     }
@@ -281,22 +263,23 @@ fn scan_directory_iter(root_dir: &Path, max_depth: i32) -> BTreeMap<PathBuf, Vec
                 Err(e) => eprintln!("Error reading directory {:?}: {}", d_path, e),
             }
         }
-
-        let relative_d_path = d_path
-            .strip_prefix(&current_dir)
-            .unwrap_or(&d_path)
-            .to_path_buf();
-        let dir_key = PathBuf::from("./").join(relative_d_path);
-        dir_map.insert(dir_key, files);
+        let dir_key = if cd {
+            PathBuf::from("./").join(d_path.strip_prefix(root_dir).unwrap_or(&d_path))
+        } else {
+            root_dir.join(d_path.strip_prefix(root_dir).unwrap_or(&d_path))
+        };
+        dir_map.insert(dir_key, file_sizes);
+        sub_dirs.reverse();
+        dir_stack.extend(sub_dirs);
     }
     dir_map
 }
-fn main() -> MyResult<()> {
+
+fn main() -> Result<()> {
     let g_args = handle_args();
     let base_dir = &g_args.path;
     let depth = g_args.depth.unwrap_or(0);
     let dir_map = scan_directory_iter(base_dir, depth);
-
     if !g_args.summarize {
         let total_size = calculate_total_dir_size(&dir_map, g_args.human_readable, |l| {
             if g_args.a || depth != -1 {
@@ -306,7 +289,7 @@ fn main() -> MyResult<()> {
 
         let output = get_file_size(None, Some(total_size));
         if g_args.human_readable {
-            println!("{:<10} .", output.formatted);
+            println!("{:<10} ", output.formatted);
         } else {
             println!("{:<10} .", total_size);
         }
@@ -320,6 +303,5 @@ fn main() -> MyResult<()> {
             println!("{:<10} .", total_size);
         }
     }
-
     Ok(())
 }
