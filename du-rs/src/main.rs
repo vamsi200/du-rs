@@ -21,9 +21,14 @@ fn get_file_size_in_bytes(file_path: &PathBuf) -> i64 {
         .map(|res| res.st_size)
         .unwrap_or(0)
 }
-fn get_disk_usage_bytes(path: &PathBuf) -> i64 {
+fn get_disk_usage_blocks(path: &PathBuf) -> i64 {
     nix::sys::stat::stat(path)
         .map(|res| (res.st_blocks * 512) / 1024)
+        .unwrap_or(0)
+}
+fn get_disk_usage_bytes(path: &PathBuf) -> i64 {
+    nix::sys::stat::stat(path)
+        .map(|res| res.st_blocks * 512)
         .unwrap_or(0)
 }
 
@@ -56,32 +61,33 @@ fn get_file_size(file_path: Option<&Path>, bytes: Option<i64>) -> FileSize {
     FileSize { bytes, formatted }
 }
 fn format_file_size(file_map: &BTreeMap<PathBuf, Vec<PathBuf>>, arg: &str) -> Result<String> {
-    const DIVISORS: [(&str, f64); 7] = [
+    const UNITS: [(&str, f64); 7] = [
+        ("K", 1024.0),
+        ("M", 1_048_576.0),
+        ("G", 1_073_741_824.0),
         ("T", 1_099_511_627_776.0),
         ("P", 1_125_899_906_842_624.0),
         ("E", 1_152_921_504_606_846_976.0),
         ("Z", 1_180_591_620_717_411_303_424.0),
-        ("Y", 1_208_925_819_614_629_174_706_176.0),
-        ("R", 1_237_940_039_285_380_274_899_124_224.0),
-        ("Q", 1_267_650_600_228_229_401_496_703_205_376.0),
     ];
+
     let mut output = String::with_capacity(16);
 
     for (dir_path, _) in file_map {
         let res = nix::sys::stat::stat(dir_path).map_err(|_| "Failed to get file size")?;
         let bytes = res.st_blocks * 512;
-        if let Some((unit, divisor)) = DIVISORS.iter().find(|&&(u, _)| u == &arg[1..]) {
-            use std::fmt::Write;
+
+        if let Some((unit, divisor)) = UNITS.iter().find(|&&(u, _)| arg == format!("-B{}", u)) {
             let _ = write!(output, "{}{}", (bytes as f64 / divisor).ceil(), unit);
+            return Ok(output);
+        } else if let Ok(block_size) = arg[2..].parse::<i64>() {
+            let adjusted_size = (bytes as f64 / block_size as f64).ceil() as i64;
+            let _ = write!(output, "{}B", adjusted_size * block_size);
             return Ok(output);
         }
     }
 
     Err("-B Requires a valid argument".into())
-}
-
-fn count_files(dir: &Path) -> u64 {
-    todo!()
 }
 
 fn calculate_total_dir_size<F>(
@@ -98,11 +104,20 @@ where
     let mut dir_sizes = BTreeMap::new();
     let mut output_buffer = String::with_capacity(256);
     let mut empty_file = String::new();
-
+    let mut dir_size;
+    let mut file_size;
     for (dir_path, file_names) in dir.iter() {
-        let mut dir_size = get_disk_usage_bytes(dir_path);
+        if !is_bytes && !format {
+            dir_size = get_disk_usage_blocks(dir_path);
+        } else {
+            dir_size = get_disk_usage_bytes(dir_path);
+        }
         for file in file_names {
-            let file_size = get_disk_usage_bytes(file);
+            if !is_bytes && !format {
+                file_size = get_disk_usage_blocks(file);
+            } else {
+                file_size = get_disk_usage_bytes(file);
+            }
             if file_size == 0 {
                 if let Ok(rel_path) = file.strip_prefix(&c_dir) {
                     if let Some(first_part) = rel_path.to_str().unwrap().split('/').next() {
@@ -135,6 +150,7 @@ where
                 output_fn(&output_buffer);
             }
         }
+
         dir_sizes.insert(dir_path, dir_size);
     }
 
@@ -142,11 +158,19 @@ where
     let mut counted_files = HashSet::new();
 
     for (dir_path, file_names) in dir.iter() {
-        total_size += get_disk_usage_bytes(dir_path);
+        if !is_bytes && !format {
+            total_size += get_disk_usage_blocks(dir_path);
+        } else {
+            total_size += get_disk_usage_bytes(dir_path);
+        }
 
         for file in file_names {
             if !counted_files.contains(file) {
-                total_size += get_disk_usage_bytes(file);
+                if !is_bytes && !format {
+                    total_size += get_disk_usage_blocks(file);
+                } else {
+                    total_size += get_disk_usage_bytes(file);
+                }
                 counted_files.insert(file);
             }
         }
@@ -157,12 +181,15 @@ where
         let relative_path = dir_path.to_str().unwrap().trim_end_matches("/");
         let root_dir = relative_path.trim_start_matches("./");
 
-        let display_size = if root_dir == empty_file && !is_bytes {
-            dir_size + (8 * 512) / 1024
+        let display_size = if root_dir == empty_file {
+            if format && r_files || format {
+                dir_size + 4096
+            } else {
+                dir_size + (8 * 512) / 1024
+            }
         } else {
             dir_size
         };
-
         if i == dir_sizes.len() - 1 {
             if format {
                 let formatted_size = get_file_size(None, Some(total_size));
@@ -194,7 +221,7 @@ where
 }
 fn print_help() {
     println!(
-        "Usage: myprogram [OPTIONS] [PATH]
+        "Usage: du-rs [OPTIONS] [PATH]
 Options:
   -h, --help              Show this help message and exit
   -a, --all               Include hidden files

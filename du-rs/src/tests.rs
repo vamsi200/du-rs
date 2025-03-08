@@ -17,10 +17,6 @@ mod tests {
         writeln!(file, "test").unwrap();
     }
 
-    fn cleanup_test_environment() {
-        let _ = fs::remove_dir_all("test_env");
-    }
-
     #[test]
     fn test_du_ah() {
         setup_test_environment();
@@ -34,17 +30,15 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         let expected_output = "\
-4.0K       test_env/test1
-4.0K       test_env/test_dir2/test.txt
+4.0K       ./test_env/test2.txt
+4.0K       ./test_env/test.txt
+4.0K       ./test_env/test_dir2/test.txt
 8.0K       test_env/test_dir2
-4.0K       test_env/test2.txt
-4.0K       test_env/test.txt
-24K       test_env
+4.0K       test_env/test1
+24.0K      test_env
 ";
 
         assert_eq!(stdout.trim(), expected_output.trim());
-
-        cleanup_test_environment();
     }
 
     #[test]
@@ -59,14 +53,12 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         let expected_output = "\
-4K       test_env/test1
-8       test_env/test_dir2
-24       test_env
+8          test_env/test_dir2
+4          test_env/test1
+24         test_env
 ";
 
         assert_eq!(stdout.trim(), expected_output.trim());
-
-        cleanup_test_environment();
     }
 
     #[test]
@@ -82,16 +74,14 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         let expected_output = "\
-4       test_env/test1
-4       test_env/test_dir2/test.txt
-8       test_env/test_dir2
-4       test_env/test2.txt
-4       test_env/test.txt
-20       test_env
+4          ./test_env/test2.txt
+4          ./test_env/test.txt
+4          ./test_env/test_dir2/test.txt
+8          test_env/test_dir2
+4          test_env/test1
+24         test_env
 ";
 
         assert_eq!(stdout.trim(), expected_output.trim());
-
-        cleanup_test_environment();
     }
 }
