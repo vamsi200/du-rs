@@ -30,9 +30,9 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         let expected_output = "\
-4.0K       ./test_env/test2.txt
-4.0K       ./test_env/test.txt
-4.0K       ./test_env/test_dir2/test.txt
+4.0K       test_env/test2.txt
+4.0K       test_env/test.txt
+4.0K       test_env/test_dir2/test.txt
 8.0K       test_env/test_dir2
 4.0K       test_env/test1
 24.0K      test_env
@@ -74,9 +74,9 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         let expected_output = "\
-4          ./test_env/test2.txt
-4          ./test_env/test.txt
-4          ./test_env/test_dir2/test.txt
+4          test_env/test2.txt
+4          test_env/test.txt
+4          test_env/test_dir2/test.txt
 8          test_env/test_dir2
 4          test_env/test1
 24         test_env

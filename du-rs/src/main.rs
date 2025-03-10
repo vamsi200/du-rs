@@ -107,14 +107,18 @@ where
     let mut dir_size;
     let mut file_size;
     for (dir_path, file_names) in dir.iter() {
-        if !is_bytes && !format {
-            dir_size = get_disk_usage_blocks(dir_path);
-        } else {
+        if is_bytes {
+            dir_size = 0;
+        } else if format {
             dir_size = get_disk_usage_bytes(dir_path);
+        } else {
+            dir_size = get_disk_usage_blocks(dir_path);
         }
         for file in file_names {
             if !is_bytes && !format {
                 file_size = get_disk_usage_blocks(file);
+            } else if is_bytes {
+                file_size = get_file_size_in_bytes(file);
             } else {
                 file_size = get_disk_usage_bytes(file);
             }
@@ -131,21 +135,41 @@ where
                 let relative_path = file.strip_prefix(&c_dir).unwrap_or(file);
                 if format {
                     let formatted_size = get_file_size(None, Some(file_size));
-                    write!(
-                        output_buffer,
-                        "{:<10} ./{}",
-                        formatted_size.formatted,
-                        relative_path.display()
-                    )
-                    .unwrap();
+                    if file == &c_dir {
+                        write!(
+                            output_buffer,
+                            "{:<10} ./{}",
+                            formatted_size.formatted,
+                            relative_path.display()
+                        )
+                        .unwrap();
+                    } else {
+                        write!(
+                            output_buffer,
+                            "{:<10} {}",
+                            formatted_size.formatted,
+                            relative_path.display()
+                        )
+                        .unwrap();
+                    }
                 } else {
-                    write!(
-                        output_buffer,
-                        "{:<10} ./{}",
-                        file_size,
-                        relative_path.display()
-                    )
-                    .unwrap();
+                    if file == &c_dir {
+                        write!(
+                            output_buffer,
+                            "{:<10} ./{}",
+                            file_size,
+                            relative_path.display()
+                        )
+                        .unwrap();
+                    } else {
+                        write!(
+                            output_buffer,
+                            "{:<10} {}",
+                            file_size,
+                            relative_path.display()
+                        )
+                        .unwrap();
+                    }
                 }
                 output_fn(&output_buffer);
             }
@@ -158,18 +182,21 @@ where
     let mut counted_files = HashSet::new();
 
     for (dir_path, file_names) in dir.iter() {
-        if !is_bytes && !format {
-            total_size += get_disk_usage_blocks(dir_path);
-        } else {
-            total_size += get_disk_usage_bytes(dir_path);
+        if !is_bytes {
+            if !format {
+                total_size += get_disk_usage_blocks(dir_path);
+            } else {
+                total_size += get_disk_usage_bytes(dir_path);
+            }
         }
-
         for file in file_names {
             if !counted_files.contains(file) {
-                if !is_bytes && !format {
-                    total_size += get_disk_usage_blocks(file);
-                } else {
+                if is_bytes {
+                    total_size += get_file_size_in_bytes(file);
+                } else if format {
                     total_size += get_disk_usage_bytes(file);
+                } else {
+                    total_size += get_disk_usage_blocks(file);
                 }
                 counted_files.insert(file);
             }
