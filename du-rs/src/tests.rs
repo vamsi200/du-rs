@@ -84,4 +84,48 @@ mod tests {
 
         assert_eq!(stdout.trim(), expected_output.trim());
     }
+    #[test]
+    fn test_du_b() {
+        setup_test_environment();
+
+        let output = Command::new("/home/vamsi/scripts/du-rs/du-rs/target/release/du-rs")
+            .arg("-b")
+            .arg("test_env")
+            .output()
+            .expect("Failed to execute process");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let expected_output = "\
+6          test_env/test_dir2
+0          test_env/test1
+17         test_env
+";
+
+        assert_eq!(stdout.trim(), expected_output.trim());
+    }
+    #[test]
+    fn test_du_b_a() {
+        setup_test_environment();
+
+        let output = Command::new("/home/vamsi/scripts/du-rs/du-rs/target/release/du-rs")
+            .arg("-b")
+            .arg("-a")
+            .arg("test_env")
+            .output()
+            .expect("Failed to execute process");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let expected_output = "\
+5          test_env/test2.txt
+6          test_env/test.txt
+6          test_env/test_dir2/test.txt
+6          test_env/test_dir2
+0          test_env/test1
+17         test_env
+";
+
+        assert_eq!(stdout.trim(), expected_output.trim());
+    }
 }

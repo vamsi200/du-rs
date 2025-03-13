@@ -2,9 +2,11 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 use nix::fcntl::OFlag;
+use nix::libc::write;
 use nix::{sys::stat::Mode, *};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::{env, error::Error, result};
@@ -15,6 +17,16 @@ struct FileSize {
     bytes: i64,
     formatted: String,
 }
+
+const UNITS: [(&str, f64); 7] = [
+    ("K", 1_024.0),
+    ("M", 1_048_576.0),
+    ("G", 1_073_741_824.0),
+    ("T", 1_099_511_627_776.0),
+    ("P", 1_125_899_906_842_624.0),
+    ("E", 1_152_921_504_606_846_976.0),
+    ("Z", 1_180_591_620_717_411_303_424.0),
+];
 
 fn get_file_size_in_bytes(file_path: &PathBuf) -> i64 {
     nix::sys::stat::stat(file_path)
@@ -60,34 +72,114 @@ fn get_file_size(file_path: Option<&Path>, bytes: Option<i64>) -> FileSize {
 
     FileSize { bytes, formatted }
 }
-fn format_file_size(file_map: &BTreeMap<PathBuf, Vec<PathBuf>>, arg: &str) -> Result<String> {
-    const UNITS: [(&str, f64); 7] = [
-        ("K", 1024.0),
-        ("M", 1_048_576.0),
-        ("G", 1_073_741_824.0),
-        ("T", 1_099_511_627_776.0),
-        ("P", 1_125_899_906_842_624.0),
-        ("E", 1_152_921_504_606_846_976.0),
-        ("Z", 1_180_591_620_717_411_303_424.0),
-    ];
+fn format_file_size<F>(
+    dir: &BTreeMap<PathBuf, Vec<PathBuf>>,
+    arg: &String,
+    show_all: bool,
+    mut output_fn: F,
+) where
+    F: FnMut(&str),
+{
+    let mut total_size = 0;
+    let mut output_buffer = String::with_capacity(256);
+    let empty_file;
+    let c_dir = env::current_dir().expect("Failed to get current directory");
 
-    let mut output = String::with_capacity(16);
+    let arg_str = arg.as_str();
+    let arg_from_2 = &arg[2..];
 
-    for (dir_path, _) in file_map {
-        let res = nix::sys::stat::stat(dir_path).map_err(|_| "Failed to get file size")?;
-        let bytes = res.st_blocks * 512;
+    let format_size = |size: i64| -> Result<String> {
+        if let Some((_, divisor)) = UNITS.iter().find(|&&(u, _)| arg_str == format!("-B{}", u)) {
+            return Ok(format!(
+                "{}{}",
+                (size as f64 / divisor).ceil() as i64,
+                arg_from_2
+            ));
+        }
 
-        if let Some((unit, divisor)) = UNITS.iter().find(|&&(u, _)| arg == format!("-B{}", u)) {
-            let _ = write!(output, "{}{}", (bytes as f64 / divisor).ceil(), unit);
-            return Ok(output);
-        } else if let Ok(block_size) = arg[2..].parse::<i64>() {
-            let adjusted_size = (bytes as f64 / block_size as f64).ceil() as i64;
-            let _ = write!(output, "{}B", adjusted_size * block_size);
-            return Ok(output);
+        if let Ok(block_size) = arg_from_2.parse::<i64>() {
+            let adjusted_size =
+                ((size as f64 / block_size as f64).ceil() * block_size as f64) as i64;
+            return Ok(adjusted_size.to_string());
+        }
+        Err("-B requires a valid argument".into())
+    };
+
+    let mut empty_path = None;
+    for (_, files) in dir.iter() {
+        for file in files {
+            if get_disk_usage_bytes(file) == 0 {
+                if let Ok(rel_path) = file.strip_prefix(&c_dir) {
+                    if let Some(f_part) = rel_path.to_str().unwrap().split('/').next() {
+                        empty_path = Some(f_part.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        if empty_path.is_some() {
+            break;
         }
     }
+    empty_file = empty_path.unwrap_or_default();
 
-    Err("-B Requires a valid argument".into())
+    for (dir_path, files) in dir.iter().rev() {
+        let mut dir_size = get_disk_usage_bytes(dir_path);
+
+        for file in files.iter().rev() {
+            let file_size = get_disk_usage_bytes(file);
+            dir_size += file_size;
+            total_size += file_size;
+
+            if show_all {
+                output_buffer.clear();
+                let formatted_file_size = format_size(file_size).unwrap();
+                let relative_path = file.strip_prefix(&c_dir).unwrap_or(file);
+                write!(
+                    &mut output_buffer,
+                    "{:<10} ./{}",
+                    formatted_file_size,
+                    relative_path.display()
+                )
+                .expect("Failed to write to buffer");
+                output_fn(&output_buffer);
+            }
+        }
+
+        let dir_relative_path = dir_path.strip_prefix(&c_dir).unwrap_or(dir_path);
+        let mut display_size = dir_size;
+        let root_dir = dir_relative_path
+            .to_str()
+            .unwrap_or("")
+            .trim_end_matches("/")
+            .trim_start_matches("./");
+
+        if root_dir == empty_file {
+            display_size += 4096;
+        }
+
+        if dir_relative_path != PathBuf::from(".") {
+            let formatted_dir_size = format_size(display_size).unwrap();
+            output_buffer.clear();
+            write!(
+                &mut output_buffer,
+                "{:<10} {}",
+                formatted_dir_size,
+                dir_relative_path.display()
+            )
+            .expect("Failed to write to buffer");
+            output_fn(&output_buffer);
+        }
+
+        let individual_dir_size = get_disk_usage_bytes(dir_path);
+        total_size += individual_dir_size;
+    }
+
+    output_buffer.clear();
+    let formatted_total_dir_size = format_size(total_size).unwrap();
+    write!(&mut output_buffer, "{:<10} ./", formatted_total_dir_size)
+        .expect("Failed to write to buffer");
+    output_fn(&output_buffer);
 }
 
 fn calculate_total_dir_size<F>(
@@ -104,24 +196,28 @@ where
     let mut dir_sizes = BTreeMap::new();
     let mut output_buffer = String::with_capacity(256);
     let mut empty_file = String::new();
-    let mut dir_size;
-    let mut file_size;
+    let mut total_size = 0;
+    let mut counted_inodes = HashSet::new();
+
     for (dir_path, file_names) in dir.iter() {
-        if is_bytes {
-            dir_size = 0;
+        let mut dir_size = if is_bytes {
+            0
         } else if format {
-            dir_size = get_disk_usage_bytes(dir_path);
+            get_disk_usage_bytes(dir_path)
         } else {
-            dir_size = get_disk_usage_blocks(dir_path);
-        }
+            get_disk_usage_blocks(dir_path)
+        };
+
+        total_size += dir_size;
         for file in file_names {
-            if !is_bytes && !format {
-                file_size = get_disk_usage_blocks(file);
+            let file_size = if !is_bytes && !format {
+                get_disk_usage_blocks(file)
             } else if is_bytes {
-                file_size = get_file_size_in_bytes(file);
+                get_file_size_in_bytes(file)
             } else {
-                file_size = get_disk_usage_bytes(file);
-            }
+                get_disk_usage_bytes(file)
+            };
+
             if file_size == 0 {
                 if let Ok(rel_path) = file.strip_prefix(&c_dir) {
                     if let Some(first_part) = rel_path.to_str().unwrap().split('/').next() {
@@ -129,78 +225,43 @@ where
                     }
                 }
             }
+
+            if let Ok(metadata) = nix::sys::stat::lstat(file) {
+                let inode = metadata.st_ino;
+                if counted_inodes.insert(inode) {
+                    total_size += file_size;
+                }
+            }
+
             dir_size += file_size;
+
             if r_files {
                 output_buffer.clear();
+
                 let relative_path = file.strip_prefix(&c_dir).unwrap_or(file);
+                let display_path = if file.starts_with(&c_dir) {
+                    format!("./{}", relative_path.display())
+                } else {
+                    format!("{}", relative_path.display())
+                };
+
                 if format {
                     let formatted_size = get_file_size(None, Some(file_size));
-                    if file == &c_dir {
-                        write!(
-                            output_buffer,
-                            "{:<10} ./{}",
-                            formatted_size.formatted,
-                            relative_path.display()
-                        )
-                        .unwrap();
-                    } else {
-                        write!(
-                            output_buffer,
-                            "{:<10} {}",
-                            formatted_size.formatted,
-                            relative_path.display()
-                        )
-                        .unwrap();
-                    }
+                    write!(
+                        output_buffer,
+                        "{:<10} {}",
+                        formatted_size.formatted, display_path
+                    )
+                    .unwrap();
                 } else {
-                    if file == &c_dir {
-                        write!(
-                            output_buffer,
-                            "{:<10} ./{}",
-                            file_size,
-                            relative_path.display()
-                        )
-                        .unwrap();
-                    } else {
-                        write!(
-                            output_buffer,
-                            "{:<10} {}",
-                            file_size,
-                            relative_path.display()
-                        )
-                        .unwrap();
-                    }
+                    write!(output_buffer, "{:<10} {}", file_size, display_path).unwrap();
                 }
+
                 output_fn(&output_buffer);
             }
         }
 
         dir_sizes.insert(dir_path, dir_size);
-    }
-
-    let mut total_size = 0;
-    let mut counted_files = HashSet::new();
-
-    for (dir_path, file_names) in dir.iter() {
-        if !is_bytes {
-            if !format {
-                total_size += get_disk_usage_blocks(dir_path);
-            } else {
-                total_size += get_disk_usage_bytes(dir_path);
-            }
-        }
-        for file in file_names {
-            if !counted_files.contains(file) {
-                if is_bytes {
-                    total_size += get_file_size_in_bytes(file);
-                } else if format {
-                    total_size += get_disk_usage_bytes(file);
-                } else {
-                    total_size += get_disk_usage_blocks(file);
-                }
-                counted_files.insert(file);
-            }
-        }
     }
 
     for (i, (&dir_path, &dir_size)) in dir_sizes.iter().rev().enumerate() {
@@ -209,14 +270,17 @@ where
         let root_dir = relative_path.trim_start_matches("./");
 
         let display_size = if root_dir == empty_file {
-            if format && r_files || format {
+            if is_bytes {
+                dir_size
+            } else if format {
                 dir_size + 4096
             } else {
-                dir_size + (8 * 512) / 1024
+                dir_size + 4 // (8 * 512) / 1024 == 4
             }
         } else {
             dir_size
         };
+
         if i == dir_sizes.len() - 1 {
             if format {
                 let formatted_size = get_file_size(None, Some(total_size));
@@ -244,6 +308,7 @@ where
         }
         output_fn(&output_buffer);
     }
+
     total_size
 }
 fn print_help() {
@@ -273,7 +338,7 @@ struct Args {
     summarize: bool,
     bytes: bool,
     total: bool,
-    block_size: Option<String>,
+    block_size: String,
     threshold: Option<u64>,
     x: Option<PathBuf>,
     xclude: Option<PathBuf>,
@@ -288,7 +353,7 @@ fn handle_args() -> Args {
     let mut summarize = false;
     let mut bytes = false;
     let mut total = false;
-    let mut block_size = None;
+    let mut block_size = String::new();
     let mut threshold = None;
     let mut x = None;
     let mut xclude = None;
@@ -315,7 +380,7 @@ fn handle_args() -> Args {
                 depth = arguments.next().and_then(|v| v.parse().ok());
             }
             _ if arg.starts_with("-B") => {
-                block_size = arg.strip_prefix("-B").map(String::from);
+                block_size = arg;
             }
             "-t" | "--threshold" => {
                 threshold = arguments.next().and_then(|v| v.parse().ok());
@@ -431,20 +496,29 @@ fn main() -> Result<()> {
             println!("{:<10} .", total_size);
         }
     };
-
-    let total_dir_size = calculate_total_dir_size(
-        &dir_map,
-        g_args.human_readable,
-        g_args.bytes,
-        g_args.a,
-        |l| {
+    let mut b = true;
+    if g_args.block_size.is_empty() {
+        b = false;
+    }
+    if b {
+        let output = format_file_size(&dir_map, &g_args.block_size, g_args.a, |l| {
             if !g_args.summarize && depth != -1 {
                 println!("{}", l);
             }
-        },
-    );
-
+        });
+    } else {
+        let total_dir_size = calculate_total_dir_size(
+            &dir_map,
+            g_args.human_readable,
+            g_args.bytes,
+            g_args.a,
+            |l| {
+                if !g_args.summarize && depth != -1 {
+                    println!("{}", l);
+                }
+            },
+        );
+    }
     //print_total_size(total_dir_size);
-
     Ok(())
 }
