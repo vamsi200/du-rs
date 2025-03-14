@@ -1,8 +1,7 @@
-- Handle Paths when given as an argument.
-- Some Logical issues compared to du in size calculations. -- I forgor.. to handle links.. that could be a reason..
+- Handle Paths when given as an argument. -- DONE
+- There are Inconsistencies in the calculations of the Directory Totals -- > [!IMPORTANT]
 - Handle all the arguments.
 - Logging?
-- Remove unnecessary imports? - 
 - Add Rayon?
 
 
