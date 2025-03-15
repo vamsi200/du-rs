@@ -99,11 +99,15 @@ fn format_file_size<F>(
     dir: &BTreeMap<PathBuf, Vec<PathBuf>>,
     arg: &String,
     show_all: bool,
+    threshold: String,
     mut output_fn: F,
 ) -> String
 where
     F: FnMut(&str),
 {
+    //FIX total directory calculation
+    let threshold_value = parse_size_to_bytes(threshold.as_str()).unwrap_or(0);
+
     let mut total_size = 0;
     let mut output_buffer = String::with_capacity(256);
     let empty_file;
@@ -155,7 +159,7 @@ where
             dir_size += file_size;
             total_size += file_size;
 
-            if show_all {
+            if show_all && file_size >= threshold_value {
                 output_buffer.clear();
                 let formatted_file_size = format_size(file_size).unwrap();
                 let relative_path = file.strip_prefix(&c_dir).unwrap_or(file);
@@ -182,7 +186,7 @@ where
             display_size += 4096;
         }
 
-        if dir_relative_path != PathBuf::from(".") {
+        if dir_relative_path != PathBuf::from(".") && dir_size >= threshold_value {
             let formatted_dir_size = format_size(display_size).unwrap();
             output_buffer.clear();
             write!(
@@ -214,11 +218,13 @@ fn calculate_total_dir_size<F>(
     is_bytes: bool,
     r_files: bool,
     threshold: String,
+    l_arg: bool,
     mut output_fn: F,
 ) -> i64
 where
     F: FnMut(&str),
 {
+    // should modify this function
     let c_dir = env::current_dir().expect("Failed to get current directory");
     let mut dir_sizes = BTreeMap::new();
     let mut output_buffer = String::with_capacity(256);
@@ -260,11 +266,10 @@ where
 
             if let Ok(metadata) = nix::sys::stat::lstat(file) {
                 let inode = metadata.st_ino;
-                if counted_inodes.insert(inode) {
+                if l_arg || counted_inodes.insert(inode) {
                     total_size += file_size;
                 }
             }
-
             dir_size += file_size;
 
             if r_files && file_size >= threshold_value {
@@ -294,10 +299,20 @@ where
             }
         }
 
-        dir_sizes.insert(dir_path, dir_size);
+        dir_sizes.insert(dir_path.clone(), dir_size);
     }
 
-    for (i, (&dir_path, &dir_size)) in dir_sizes.iter().rev().enumerate() {
+    for (dir_path, &dir_size) in dir_sizes.clone().iter() {
+        let mut current_path = dir_path.clone();
+        while let Some(parent) = current_path.parent() {
+            if let Some(parent_size) = dir_sizes.get_mut(parent) {
+                *parent_size += dir_size;
+            }
+            current_path = parent.to_path_buf();
+        }
+    }
+
+    for (i, (&ref dir_path, &dir_size)) in dir_sizes.iter().rev().enumerate() {
         output_buffer.clear();
         let relative_path = dir_path.to_str().unwrap().trim_end_matches("/");
         let root_dir = relative_path.trim_start_matches("./");
@@ -386,6 +401,7 @@ struct Args {
     x: Option<PathBuf>,
     xclude: Option<PathBuf>,
     a: bool,
+    l: bool,
 }
 
 fn handle_args() -> Args {
@@ -401,12 +417,13 @@ fn handle_args() -> Args {
     let mut x = None;
     let mut xclude = None;
     let mut a = false;
-
+    let mut l = false;
     while let Some(arg) = arguments.next() {
         match arg.as_str() {
             "--help" => print_help(),
             "-h" | "--human-readable" => human_readable = true,
             "-a" | "--all" => a = true,
+            "-l" => l = true,
             "-ah" => {
                 a = true;
                 human_readable = true;
@@ -456,14 +473,21 @@ fn handle_args() -> Args {
         xclude,
         x,
         a,
+        l,
     }
 }
-fn scan_directory_iter(root_dir: &Path, max_depth: i32) -> BTreeMap<PathBuf, Vec<PathBuf>> {
+fn scan_directory_iter(
+    root_dir: &Path,
+    max_depth: i32,
+    x_option: Option<&Path>,
+) -> BTreeMap<PathBuf, Vec<PathBuf>> {
     let current_dir = env::current_dir().unwrap();
     let cd = current_dir == root_dir;
 
     let mut dir_stack = Vec::with_capacity(256);
     let mut dir_map = BTreeMap::new();
+
+    let root_dev = x_option.map(|_| nix::sys::stat::stat(root_dir).unwrap().st_dev);
 
     let no_depth = max_depth == 0;
     dir_stack.push((root_dir.to_path_buf(), 0));
@@ -474,6 +498,13 @@ fn scan_directory_iter(root_dir: &Path, max_depth: i32) -> BTreeMap<PathBuf, Vec
     while let Some((d_path, depth)) = dir_stack.pop() {
         file_names.clear();
         sub_dirs.clear();
+
+        if let Some(root_dev) = root_dev {
+            let sub_dir_dev = nix::sys::stat::stat(&d_path).unwrap().st_dev;
+            if root_dev != sub_dir_dev {
+                continue;
+            }
+        }
 
         let open_dir = match nix::dir::Dir::open(&d_path, OFlag::O_RDONLY, Mode::empty()) {
             Ok(dir) => dir,
@@ -529,17 +560,23 @@ fn main() -> Result<()> {
     let g_args = handle_args();
     let base_dir = &g_args.path;
     let depth = g_args.depth.unwrap_or(0);
-    let dir_map = scan_directory_iter(base_dir, depth);
+    let dir_map = scan_directory_iter(base_dir, depth, g_args.x.as_deref());
     let mut b = true;
     if g_args.block_size.is_empty() {
         b = false;
     }
     if b {
-        let output = format_file_size(&dir_map, &g_args.block_size, g_args.a, |l| {
-            if !g_args.summarize && depth != -1 {
-                println!("{}", l);
-            }
-        });
+        let output = format_file_size(
+            &dir_map,
+            &g_args.block_size,
+            g_args.a,
+            g_args.threshold.unwrap_or_default(),
+            |l| {
+                if !g_args.summarize && depth != -1 {
+                    println!("{}", l);
+                }
+            },
+        );
         if g_args.summarize {
             println!("{:<10}  .", output);
         }
@@ -550,6 +587,7 @@ fn main() -> Result<()> {
             g_args.bytes,
             g_args.a,
             g_args.threshold.unwrap_or_default(),
+            g_args.l,
             |l| {
                 if !g_args.summarize && depth != -1 {
                     println!("{}", l);
