@@ -3,6 +3,7 @@
 - Handle all the arguments.
 - Logging?
 - Add Rayon?
+- Handle Errors properly
 
 
 Last:
