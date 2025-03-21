@@ -5,13 +5,14 @@ use nix::fcntl::OFlag;
 use nix::libc::write;
 use nix::{sys::stat::Mode, *};
 use std::collections::{BTreeMap, HashSet};
+use std::env;
+use std::ffi::OsStr;
 use std::fmt::Write;
 use std::ops::Deref;
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::exit;
-use std::{env, error::Error, result};
-
-type Result<T> = result::Result<T, Box<dyn Error>>;
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 struct FileSize {
     bytes: i64,
@@ -479,14 +480,64 @@ fn handle_args() -> Args {
         l,
     }
 }
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+enum FileContent {
+    Path(PathBuf),
+    Pattern(String),
+}
+fn exclude_list(file: &Path) -> HashSet<FileContent> {
+    let file_fd: RawFd = nix::fcntl::open(file, OFlag::O_RDONLY, Mode::empty()).unwrap();
+    let mut buffer = [0u8; 1024];
+    let mut content = String::new();
+    let mut hs = HashSet::new();
+
+    loop {
+        let bytes_read = nix::unistd::read(file_fd, &mut buffer).unwrap();
+        if bytes_read == 0 {
+            break;
+        }
+        content.push_str(&String::from_utf8_lossy(&buffer[..bytes_read]));
+    }
+    nix::unistd::close(file_fd).unwrap();
+
+    let current_dir = env::current_dir().unwrap();
+
+    for line in content.lines() {
+        let trimmed_line = line.trim();
+
+        if trimmed_line.is_empty() {
+            continue;
+        }
+
+        let path = Path::new(trimmed_line);
+        if path.is_absolute() {
+            if path.exists() && path.is_dir() {
+                hs.insert(FileContent::Path(path.to_path_buf()));
+            } else if trimmed_line.starts_with("*.") {
+                let extension = &trimmed_line[2..];
+                hs.insert(FileContent::Pattern(extension.to_string()));
+            }
+        } else {
+            let full_path = current_dir.join(path);
+            if full_path.exists() && full_path.is_dir() {
+                hs.insert(FileContent::Path(full_path));
+            } else if trimmed_line.starts_with("*.") {
+                let extension = &trimmed_line[2..];
+                hs.insert(FileContent::Pattern(extension.to_string()));
+            }
+        }
+    }
+    hs
+}
 fn scan_directory_iter(
     root_dir: &Path,
     max_depth: i32,
     x_option: Option<&Path>,
+    is_exclude: Option<&Path>,
 ) -> BTreeMap<PathBuf, Vec<PathBuf>> {
+    //FIX maybe have to remove the capacity that we set
     let current_dir = env::current_dir().unwrap();
     let cd = current_dir == root_dir;
-
     let mut dir_stack = Vec::with_capacity(256);
     let mut dir_map = BTreeMap::new();
 
@@ -497,6 +548,17 @@ fn scan_directory_iter(
 
     let mut file_names = Vec::with_capacity(64);
     let mut sub_dirs = Vec::with_capacity(64);
+    let mut exclusion_paths = Vec::new();
+    let mut exclusion_patterns = Vec::new();
+
+    if let Some(exclude_path) = is_exclude {
+        for s in exclude_list(exclude_path) {
+            match s {
+                FileContent::Path(p) => exclusion_paths.push(p),
+                FileContent::Pattern(pt) => exclusion_patterns.push(OsStr::new(&pt).to_os_string()),
+            }
+        }
+    }
 
     while let Some((d_path, depth)) = dir_stack.pop() {
         file_names.clear();
@@ -526,12 +588,21 @@ fn scan_directory_iter(
                 }
             };
 
-            let file_name_bytes = entry.file_name().to_bytes();
-            if file_name_bytes == b"." || file_name_bytes == b".." {
+            let file_name = entry.file_name().to_str().unwrap_or("");
+            if file_name == "." || file_name == ".." {
                 continue;
             }
 
-            let full_path = d_path.join(Path::new(entry.file_name().to_str().unwrap_or("")));
+            let full_path = d_path.join(file_name);
+
+            if exclusion_paths.iter().any(|ex| full_path == *ex) {
+                continue;
+            }
+            if let Some(ext) = full_path.extension() {
+                if exclusion_patterns.iter().any(|pat| ext == pat) {
+                    continue;
+                }
+            }
 
             match entry.file_type() {
                 Some(nix::dir::Type::Directory) => {
@@ -568,7 +639,12 @@ fn main() -> Result<()> {
         base_dir = g_args.path;
     }
     let depth = g_args.depth.unwrap_or(0);
-    let dir_map = scan_directory_iter(&base_dir, depth, g_args.x.as_deref());
+    let dir_map = scan_directory_iter(
+        &base_dir,
+        depth,
+        g_args.x.as_deref(),
+        g_args.xclude.as_deref(),
+    );
     let mut b = true;
     if g_args.block_size.is_empty() {
         b = false;
@@ -609,5 +685,6 @@ fn main() -> Result<()> {
             println!("{:<10} .", total_dir_size);
         }
     }
+
     Ok(())
 }
