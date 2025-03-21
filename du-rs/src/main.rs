@@ -105,12 +105,8 @@ fn format_file_size<F>(
 where
     F: FnMut(&str),
 {
-    //FIX total directory calculation
     let threshold_value = parse_size_to_bytes(threshold.as_str()).unwrap_or(0);
-
-    let mut total_size = 0;
     let mut output_buffer = String::with_capacity(256);
-    let empty_file;
     let c_dir = env::current_dir().expect("Failed to get current directory");
 
     let arg_str = arg.as_str();
@@ -133,29 +129,25 @@ where
         Err("-B requires a valid argument".into())
     };
 
-    let mut empty_path = None;
-    for (_, files) in dir.iter() {
+    let mut empty_file = String::new();
+    let mut dir_sizes = BTreeMap::new();
+    let mut total_size = 0;
+
+    for (dir_path, files) in dir.iter() {
+        let mut dir_size = get_disk_usage_bytes(dir_path);
+        total_size += dir_size;
+
         for file in files {
-            if get_disk_usage_bytes(file) == 0 {
+            let file_size = get_disk_usage_bytes(file);
+
+            if file_size == 0 {
                 if let Ok(rel_path) = file.strip_prefix(&c_dir) {
-                    if let Some(f_part) = rel_path.to_str().unwrap().split('/').next() {
-                        empty_path = Some(f_part.to_string());
-                        break;
+                    if let Some(first_part) = rel_path.to_str().unwrap().split('/').next() {
+                        empty_file = first_part.to_string();
                     }
                 }
             }
-        }
-        if empty_path.is_some() {
-            break;
-        }
-    }
-    empty_file = empty_path.unwrap_or_default();
 
-    for (dir_path, files) in dir.iter().rev() {
-        let mut dir_size = get_disk_usage_bytes(dir_path);
-
-        for file in files.iter().rev() {
-            let file_size = get_disk_usage_bytes(file);
             dir_size += file_size;
             total_size += file_size;
 
@@ -174,8 +166,23 @@ where
             }
         }
 
+        dir_sizes.insert(dir_path.clone(), dir_size);
+    }
+
+    for (dir_path, &dir_size) in dir_sizes.clone().iter() {
+        let mut current_path = dir_path.clone();
+        while let Some(parent) = current_path.parent() {
+            if let Some(parent_size) = dir_sizes.get_mut(&parent.to_path_buf()) {
+                *parent_size += dir_size;
+            }
+            current_path = parent.to_path_buf();
+        }
+    }
+
+    for (dir_path, &dir_size) in dir_sizes.iter().rev() {
         let dir_relative_path = dir_path.strip_prefix(&c_dir).unwrap_or(dir_path);
         let mut display_size = dir_size;
+
         let root_dir = dir_relative_path
             .to_str()
             .unwrap_or("")
@@ -186,7 +193,7 @@ where
             display_size += 4096;
         }
 
-        if dir_relative_path != PathBuf::from(".") && dir_size >= threshold_value {
+        if dir_relative_path != PathBuf::from(".") && display_size >= threshold_value {
             let formatted_dir_size = format_size(display_size).unwrap();
             output_buffer.clear();
             write!(
@@ -198,20 +205,16 @@ where
             .expect("Failed to write to buffer");
             output_fn(&output_buffer);
         }
-
-        let individual_dir_size = get_disk_usage_bytes(dir_path);
-        total_size += individual_dir_size;
     }
 
-    output_buffer.clear();
     let formatted_total_dir_size = format_size(total_size).unwrap();
+    output_buffer.clear();
     write!(&mut output_buffer, "{:<10} ./", formatted_total_dir_size)
         .expect("Failed to write to buffer");
     output_fn(&output_buffer);
 
     formatted_total_dir_size
 }
-
 fn calculate_total_dir_size<F>(
     dir: &BTreeMap<PathBuf, Vec<PathBuf>>,
     format: bool,
