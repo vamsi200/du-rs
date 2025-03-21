@@ -561,9 +561,14 @@ fn scan_directory_iter(
 mod tests;
 fn main() -> Result<()> {
     let g_args = handle_args();
-    let base_dir = &g_args.path;
+    let base_dir;
+    if g_args.x.is_some() {
+        base_dir = g_args.x.clone().unwrap_or(g_args.path);
+    } else {
+        base_dir = g_args.path;
+    }
     let depth = g_args.depth.unwrap_or(0);
-    let dir_map = scan_directory_iter(base_dir, depth, g_args.x.as_deref());
+    let dir_map = scan_directory_iter(&base_dir, depth, g_args.x.as_deref());
     let mut b = true;
     if g_args.block_size.is_empty() {
         b = false;
