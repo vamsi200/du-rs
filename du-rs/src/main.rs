@@ -1,10 +1,8 @@
-#![allow(unused_variables)]
 use nix::fcntl::OFlag;
 use nix::sys::stat::Mode;
 use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
-use std::fmt::Write;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::exit;
@@ -114,7 +112,9 @@ where
         env::current_dir().map_err(|e| format!("Failed to get current directory: {}", e))?;
 
     let arg_str = arg.as_str();
-    let arg_from_2 = arg.get(2..).ok_or("-B argument is invalid")?;
+    let arg_from_2 = arg
+        .get(2..)
+        .ok_or_else(|| "-B argument is invalid".to_string())?;
 
     let format_size = |size: i64| -> Result<String> {
         if let Some((_, divisor)) = UNITS.iter().find(|&&(u, _)| arg_str == format!("-B{}", u)) {
@@ -127,7 +127,7 @@ where
 
         let block_size = arg_from_2
             .parse::<i64>()
-            .map_err(|_| "-B requires a valid argument")?;
+            .map_err(|_| "-B requires a valid argument".to_string())?;
         let adjusted_size = ((size as f64 / block_size as f64).ceil() * block_size as f64) as i64;
         Ok(adjusted_size.to_string())
     };
@@ -158,13 +158,11 @@ where
                 output_buffer.clear();
                 let formatted_file_size = format_size(file_size)?;
                 let relative_path = file.strip_prefix(&c_dir).unwrap_or(file);
-                writeln!(
-                    &mut output_buffer,
+                output_buffer.push_str(&format!(
                     "{:<10} ./{}",
                     formatted_file_size,
                     relative_path.display()
-                )
-                .map_err(|e| format!("Failed to write to buffer: {}", e))?;
+                ));
                 output_fn(&output_buffer);
             }
         }
@@ -186,7 +184,10 @@ where
         let dir_relative_path = dir_path.strip_prefix(&c_dir).unwrap_or(dir_path);
         let mut display_size = dir_size;
 
-        let root_dir = dir_relative_path.to_str().unwrap_or("").trim_matches('/');
+        let root_dir = dir_relative_path
+            .to_str()
+            .map(|s| s.trim_end_matches('/').trim_start_matches("./"))
+            .unwrap_or("");
 
         if root_dir == empty_file {
             display_size += 4096;
@@ -195,21 +196,18 @@ where
         if dir_relative_path != PathBuf::from(".") && display_size >= threshold_value {
             let formatted_dir_size = format_size(display_size)?;
             output_buffer.clear();
-            writeln!(
-                &mut output_buffer,
+            output_buffer.push_str(&format!(
                 "{:<10} {}",
                 formatted_dir_size,
                 dir_relative_path.display()
-            )
-            .map_err(|e| format!("Failed to write to buffer: {}", e))?;
+            ));
             output_fn(&output_buffer);
         }
     }
 
     let formatted_total_dir_size = format_size(total_size)?;
     output_buffer.clear();
-    writeln!(&mut output_buffer, "{:<10} ./", formatted_total_dir_size)
-        .map_err(|e| format!("Failed to write to buffer: {}", e))?;
+    output_buffer.push_str(&format!("{:<10} ./", formatted_total_dir_size));
     output_fn(&output_buffer);
 
     Ok(formatted_total_dir_size)
@@ -538,7 +536,7 @@ fn scan_directory_iter(
     let mut dir_stack = Vec::with_capacity(256);
     let mut dir_map = BTreeMap::new();
 
-    let root_dev = if let Some(x_path) = x_option {
+    let root_dev = if let Some(_) = x_option {
         Some(nix::sys::stat::stat(root_dir)?.st_dev)
     } else {
         None
