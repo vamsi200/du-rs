@@ -154,6 +154,7 @@ where
 
         for file in files {
             let file_size = get_disk_usage_bytes(file);
+            // getting the filename that is empty(0 bytes) and setting it to empty_file.
             if file_size == 0 {
                 if let Ok(rel_path) = file.strip_prefix(&c_dir) {
                     if let Some(first_component) = rel_path.components().next() {
@@ -165,10 +166,12 @@ where
                     }
                 }
             }
-
+            // updating the size of the directory in dir_sizes map by adding the size of the
+            // current file
             dir_sizes
                 .entry(dir_path.clone())
                 .and_modify(|s| *s += file_size);
+
             total_size += file_size;
 
             if show_all && file_size >= threshold_value {
@@ -188,6 +191,14 @@ where
     }
 
     let mut dirs: Vec<_> = dir_sizes.keys().cloned().collect();
+    // First we count the number of components that is :
+    // /path -> 1 component
+    // /path/path_2 -> 2 components
+    // /path/path_2/path_3 -> 3 components and so on..
+    // Reversing it so that it becomes 'likes of DFS'
+    // Next, we are using sort_by_cached_key to sort the
+    // vectors while caching the key for each element to improve perf (it avoids recomputing depth
+    // for each component)
     dirs.sort_by_cached_key(|p| std::cmp::Reverse(p.components().count()));
 
     for dir_path in &dirs {
@@ -337,6 +348,14 @@ where
     }
 
     let mut dirs: Vec<_> = dir_sizes.keys().cloned().collect();
+    // First we count the number of components that is :
+    // /path -> 1 component
+    // /path/path_2 -> 2 components
+    // /path/path_2/path_3 -> 3 components and so on..
+    // Reversing it so that it becomes 'likes of DFS'
+    // Next, we are using sort_by_cached_key to sort the
+    // vectors while caching the key for each element to improve perf (it avoids recomputing depth
+    // for each component)
     dirs.sort_by_cached_key(|p| std::cmp::Reverse(p.components().count()));
 
     for dir_path in &dirs {
