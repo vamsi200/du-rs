@@ -1,5 +1,8 @@
+use fxhash::FxHashSet;
 use nix::fcntl::OFlag;
+use nix::sys::stat;
 use nix::sys::stat::Mode;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
@@ -9,6 +12,34 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+struct FileStats {
+    size: i64,
+    blocks: i64,
+}
+
+impl FileStats {
+    fn from(path: &PathBuf) -> Self {
+        match stat::stat(path) {
+            Ok(res) => Self {
+                size: res.st_size,
+                blocks: res.st_blocks,
+            },
+            Err(_) => Self { size: 0, blocks: 0 },
+        }
+    }
+
+    fn size_in_bytes(&self) -> i64 {
+        self.size
+    }
+
+    fn disk_usage_blocks(&self) -> i64 {
+        (self.blocks * 512) / 1024
+    }
+
+    fn disk_usage_bytes(&self) -> i64 {
+        self.blocks * 512
+    }
+}
 const UNITS: [(&str, f64); 7] = [
     ("K", 1_024.0),
     ("M", 1_048_576.0),
@@ -18,88 +49,48 @@ const UNITS: [(&str, f64); 7] = [
     ("E", 1_152_921_504_606_846_976.0),
     ("Z", 1_180_591_620_717_411_303_424.0),
 ];
-
-fn get_file_size_in_bytes(file_path: &PathBuf) -> i64 {
-    match nix::sys::stat::stat(file_path) {
-        Ok(res) => res.st_size,
-        Err(_) => 0,
-    }
-}
-
-fn get_disk_usage_blocks(path: &PathBuf) -> i64 {
-    match nix::sys::stat::stat(path) {
-        Ok(res) => (res.st_blocks * 512) / 1024,
-        Err(_) => 0,
-    }
-}
-
-fn get_disk_usage_bytes(path: &PathBuf) -> i64 {
-    match nix::sys::stat::stat(path) {
-        Ok(res) => res.st_blocks * 512,
-        Err(_) => 0,
-    }
-}
-
 fn parse_size_to_bytes(size_str: &str) -> Option<i64> {
     let size_str = size_str.trim().to_uppercase();
     let num_end = size_str
         .chars()
-        .position(|c| !c.is_digit(10) && c != '.')
+        .position(|c| !c.is_ascii_digit() && c != '.')
         .unwrap_or(size_str.len());
+
     let num_part: f64 = size_str[..num_end].parse().ok()?;
     let unit_part = &size_str[num_end..];
 
-    let multiplier: i64 = match unit_part {
-        "B" | "" => 1,
-        "K" | "KB" => 1024,
-        "M" | "MB" => 1024 * 1024,
-        "G" | "GB" => 1024 * 1024 * 1024,
-        "T" | "TB" => 1024 * 1024 * 1024 * 1024,
-        _ => return None,
-    };
+    let unit_map: HashMap<&str, f64> = UNITS.iter().cloned().collect();
 
-    Some((num_part * multiplier as f64) as i64)
+    let multiplier = unit_map.get(unit_part).copied().unwrap_or(1.0);
+    Some((num_part * multiplier) as i64)
 }
 
-struct FileSize {
-    bytes: i64,
-    formatted: String,
-}
-
-fn get_file_sizes(file_path: Option<&Path>, bytes: Option<i64>) -> FileSize {
-    static UNITS: [&str; 3] = ["K", "M", "G"];
-    static DIVISORS: [i64; 3] = [1024, 1048576, 1073741824];
-
-    let bytes = if let Some(f) = file_path {
-        match nix::sys::stat::stat(f) {
-            Ok(res) => res.st_blocks * 512,
-            Err(_) => 0,
-        }
+fn get_file_sizes(file_path: Option<&Path>, bytes: Option<i64>) -> String {
+    let bytes = if let Some(path) = file_path {
+        stat::stat(path).map(|res| res.st_blocks * 512).unwrap_or(0)
     } else {
         bytes.unwrap_or(0)
     };
 
-    let mut formatted = String::with_capacity(16);
     if bytes < 1024 {
-        formatted.push_str(&format!("{}B", bytes));
-    } else {
-        let (value, unit) = UNITS
-            .iter()
-            .zip(DIVISORS.iter())
-            .find(|&(_, &div)| bytes < div * 1024)
-            .map(|(unit, &div)| ((bytes as f64) / (div as f64), unit))
-            .unwrap_or(((bytes as f64) / 1073741824.0, &"G"));
-
-        use std::fmt::Write;
-        let _ = write!(formatted, "{:.1}{}", value, unit);
+        return format!("{bytes}B");
     }
 
-    FileSize { bytes, formatted }
+    let mut value = bytes as f64;
+    let mut unit = "B";
+
+    for (u, div) in UNITS.iter() {
+        if bytes < (*div as i64) * 1024 {
+            unit = u;
+            value /= div;
+            break;
+        }
+    }
+
+    format!("{:.1}{}", value, unit)
 }
-enum Either<A, B> {
-    Left(A),
-    Right(B),
-}
+//use Cow
+//use fxhash
 fn format_file_size<F>(
     dir: &BTreeMap<PathBuf, Vec<PathBuf>>,
     arg: &str,
@@ -115,57 +106,36 @@ where
     let c_dir =
         env::current_dir().map_err(|e| format!("Failed to get current directory: {}", e))?;
 
-    let (arg_from_2, block_size) = if let Some(unit) = arg.strip_prefix("-B") {
-        if let Some(&(_, divisor)) = UNITS.iter().find(|&&(u, _)| unit == u) {
-            (unit, Either::Left(divisor))
-        } else {
-            let block_size = unit
-                .parse::<i64>()
-                .map_err(|_| "-B requires a valid argument".to_string())?;
-            (unit, Either::Right(block_size))
-        }
-    } else {
-        return Err("Invalid argument format".into());
-    };
-
+    let arg_str = arg;
+    let arg_from_2 = &arg[2..];
     let format_size = |size: i64| -> Result<String> {
-        match block_size {
-            Either::Left(divisor) => Ok(format!(
-                "{}{}",
-                (size as f64 / divisor).ceil() as i64,
-                arg_from_2
-            )),
-            Either::Right(block_size) => {
-                let adjusted_size =
-                    ((size as f64 / block_size as f64).ceil() * block_size as f64) as i64;
-                Ok(adjusted_size.to_string())
-            }
+        if let Some((_, divisor)) = UNITS.iter().find(|&&(u, _)| arg_str == format!("-B{}", u)) {
+            // If using unit-based sizes (-BG, -BM, etc.), ensure
+            let adjusted_size = (size as f64 / divisor).ceil() as i64;
+            return Ok(format!("{}{}", adjusted_size, arg_from_2));
         }
+
+        if let Ok(block_size) = arg_from_2.parse::<i64>() {
+            // For -B<size> (e.g., -B1024), use normal rounding behavior
+            let adjusted_size = (size as f64 / block_size as f64).ceil() as i64;
+            return Ok(adjusted_size.to_string());
+        }
+
+        Err("-B requires a valid argument".into())
     };
 
-    let mut empty_file = String::new();
-    let mut dir_sizes = HashMap::new();
+    let mut dir_sizes = BTreeMap::new();
     let mut total_size = 0;
-
-    for (dir_path, files) in dir {
-        let dir_size = get_disk_usage_bytes(dir_path);
+    let get_size: fn(&FileStats) -> i64 = FileStats::disk_usage_bytes;
+    for (dir_path, files) in dir.iter() {
+        let dir_stats = FileStats::from(dir_path);
+        let dir_size = get_size(&dir_stats);
         total_size += dir_size;
         dir_sizes.insert(dir_path.clone(), dir_size);
 
         for file in files {
-            let file_size = get_disk_usage_bytes(file);
-            // getting the filename that is empty(0 bytes) and setting it to empty_file.
-            if file_size == 0 {
-                if let Ok(rel_path) = file.strip_prefix(&c_dir) {
-                    if let Some(first_component) = rel_path.components().next() {
-                        empty_file = first_component
-                            .as_os_str()
-                            .to_str()
-                            .unwrap_or("")
-                            .to_string();
-                    }
-                }
-            }
+            let file_stats = FileStats::from(file);
+            let file_size = get_size(&file_stats);
             // updating the size of the directory in dir_sizes map by adding the size of the
             // current file
             dir_sizes
@@ -190,45 +160,21 @@ where
         }
     }
 
-    let mut dirs: Vec<_> = dir_sizes.keys().cloned().collect();
-    // First we count the number of components that is :
-    // /path -> 1 component
-    // /path/path_2 -> 2 components
-    // /path/path_2/path_3 -> 3 components and so on..
-    // Reversing it so that it becomes 'likes of DFS'
-    // Next, we are using sort_by_cached_key to sort the
-    // vectors while caching the key for each element to improve perf (it avoids recomputing depth
-    // for each component)
-    dirs.sort_by_cached_key(|p| std::cmp::Reverse(p.components().count()));
-
-    for dir_path in &dirs {
-        if let Some(parent) = dir_path.parent() {
-            let parent_path = parent.to_path_buf();
-            let current_dir_size = dir_sizes[dir_path];
-            if let Some(parent_size) = dir_sizes.get_mut(&parent_path) {
-                *parent_size += current_dir_size;
+    for (dir_path, &dir_size) in dir_sizes.clone().iter() {
+        let mut current_path = dir_path.clone();
+        while let Some(parent) = current_path.parent() {
+            if let Some(parent_size) = dir_sizes.get_mut(parent) {
+                *parent_size += dir_size;
             }
+            current_path = parent.to_path_buf();
         }
     }
-    let mut sorted_dirs: Vec<_> = dir_sizes.iter().collect();
-    sorted_dirs.sort_by(|a, b| b.0.cmp(a.0));
-
-    for (dir_path, &dir_size) in sorted_dirs {
+    for (dir_path, &dir_size) in dir_sizes.iter().rev() {
         let dir_relative_path = dir_path.strip_prefix(&c_dir).unwrap_or(dir_path);
-        let root_dir = dir_relative_path
-            .to_str()
-            .map(|s| s.trim_end_matches('/').trim_start_matches("./"))
-            .unwrap_or("");
 
-        let display_size = if root_dir == empty_file {
-            dir_size + 4096
-        } else {
-            dir_size
-        };
-
-        if dir_relative_path != Path::new(".") && display_size >= threshold_value {
+        if dir_relative_path != Path::new(".") && dir_size >= threshold_value {
             output_buffer.clear();
-            let formatted_dir_size = format_size(display_size)?;
+            let formatted_dir_size = format_size(dir_size)?;
             write!(
                 output_buffer,
                 "{:<10} {}",
@@ -249,6 +195,22 @@ where
     Ok(formatted_total)
 }
 
+const fn select_dir_size_fn(is_bytes: bool, format: bool) -> fn(&FileStats) -> i64 {
+    match (is_bytes, format) {
+        (true, _) => |_| 0,
+        (false, true) => FileStats::disk_usage_bytes,
+        (false, false) => FileStats::disk_usage_blocks,
+    }
+}
+
+const fn select_file_size_fn(is_bytes: bool, format: bool) -> fn(&FileStats) -> i64 {
+    match (is_bytes, format) {
+        (true, _) => FileStats::size_in_bytes,
+        (false, true) => FileStats::disk_usage_bytes,
+        (false, false) => FileStats::disk_usage_blocks,
+    }
+}
+
 fn calculate_total_dir_size<F>(
     dir: &BTreeMap<PathBuf, Vec<PathBuf>>,
     format: bool,
@@ -261,6 +223,9 @@ fn calculate_total_dir_size<F>(
 where
     F: FnMut(&str),
 {
+    let get_dir_size = select_dir_size_fn(is_bytes, format);
+    let get_file_size = select_file_size_fn(is_bytes, format);
+
     let c_dir = match env::current_dir() {
         Ok(dir) => dir,
         Err(_) => {
@@ -270,10 +235,8 @@ where
     };
 
     let mut dir_sizes = BTreeMap::new();
-    let mut output_buffer = String::with_capacity(256);
-    let mut empty_file = String::new();
     let mut total_size = 0;
-    let mut counted_inodes = HashSet::new();
+    let mut counted_inodes = FxHashSet::default();
 
     let threshold_value = if is_bytes || format {
         parse_size_to_bytes(&threshold).unwrap_or(0)
@@ -281,40 +244,14 @@ where
         parse_size_to_bytes(&threshold).unwrap_or(0) / 1024
     };
 
-    let get_dir_size = if is_bytes {
-        |_: &PathBuf| 0
-    } else if format {
-        get_disk_usage_bytes
-    } else {
-        get_disk_usage_blocks
-    };
-
-    let get_file_size = if !is_bytes && !format {
-        get_disk_usage_blocks
-    } else if is_bytes {
-        get_file_size_in_bytes
-    } else {
-        get_disk_usage_bytes
-    };
-
     for (dir_path, file_names) in dir {
-        let mut dir_size = get_dir_size(dir_path);
+        let dir_stats = FileStats::from(dir_path);
+        let mut dir_size = get_dir_size(&dir_stats);
         total_size += dir_size;
 
         for file in file_names {
-            let file_size = get_file_size(file);
-
-            if file_size == 0 {
-                if let Ok(rel_path) = file.strip_prefix(&c_dir) {
-                    if let Some(first_component) = rel_path.components().next() {
-                        empty_file = first_component
-                            .as_os_str()
-                            .to_str()
-                            .unwrap_or("")
-                            .to_string();
-                    }
-                }
-            }
+            let file_stats = FileStats::from(file);
+            let file_size = get_file_size(&file_stats);
 
             if let Ok(metadata) = nix::sys::stat::lstat(file) {
                 let inode = metadata.st_ino;
@@ -325,17 +262,17 @@ where
             dir_size += file_size;
 
             if r_files && file_size >= threshold_value {
-                output_buffer.clear();
                 let relative_path = file.strip_prefix(&c_dir).unwrap_or(file);
-                let display_path = if file.starts_with(&c_dir) {
-                    format!("./{}", relative_path.display())
+
+                let display_path: Cow<str> = if file.starts_with(&c_dir) {
+                    Cow::Owned(format!("./{}", relative_path.display()))
                 } else {
-                    relative_path.display().to_string()
+                    Cow::Borrowed(relative_path.to_str().unwrap_or(""))
                 };
 
                 let formatted_output = if format {
                     let formatted_size = get_file_sizes(None, Some(file_size));
-                    format!("{:<10} {}", formatted_size.formatted, display_path)
+                    format!("{:<10} {}", formatted_size, display_path)
                 } else {
                     format!("{:<10} {}", file_size, display_path)
                 };
@@ -347,81 +284,41 @@ where
         dir_sizes.insert(dir_path.clone(), dir_size);
     }
 
-    let mut dirs: Vec<_> = dir_sizes.keys().cloned().collect();
-    // First we count the number of components that is :
-    // /path -> 1 component
-    // /path/path_2 -> 2 components
-    // /path/path_2/path_3 -> 3 components and so on..
-    // Reversing it so that it becomes 'likes of DFS'
-    // Next, we are using sort_by_cached_key to sort the
-    // vectors while caching the key for each element to improve perf (it avoids recomputing depth
-    // for each component)
-    dirs.sort_by_cached_key(|p| std::cmp::Reverse(p.components().count()));
-
-    for dir_path in &dirs {
-        if let Some(parent) = dir_path.parent() {
-            let parent_path = parent.to_path_buf();
-            let current_dir_size = dir_sizes[dir_path];
-            if let Some(parent_size) = dir_sizes.get_mut(&parent_path) {
-                *parent_size += current_dir_size;
+    for (dir_path, &dir_size) in dir_sizes.clone().iter() {
+        let mut current_path = dir_path.clone();
+        while let Some(parent) = current_path.parent() {
+            if let Some(parent_size) = dir_sizes.get_mut(parent) {
+                *parent_size += dir_size;
             }
+            current_path = parent.to_path_buf();
         }
     }
-    let mut sorted_dirs: Vec<_> = dir_sizes.iter().collect();
-    sorted_dirs.sort_by(|a, b| b.0.cmp(a.0));
 
-    for (i, (dir_path, &dir_size)) in sorted_dirs.iter().enumerate() {
-        output_buffer.clear();
-        let relative_path = dir_path.to_str().unwrap_or("").trim_end_matches('/');
-        let root_dir = relative_path.trim_start_matches("./");
+    for (i, (dir_path, &dir_size)) in dir_sizes.iter().rev().enumerate() {
+        if dir_size < threshold_value {
+            continue;
+        }
 
-        let display_size = if root_dir == empty_file {
-            if is_bytes {
-                dir_size
-            } else if format {
-                dir_size + 4096
-            } else {
-                dir_size + 4
-            }
+        let relative_path: Cow<str> =
+            Cow::Borrowed(dir_path.to_str().unwrap_or("").trim_end_matches('/'));
+
+        let size_to_display = if i == dir_sizes.len() - 1 {
+            total_size
         } else {
             dir_size
         };
 
-        let formatted_output = if i == sorted_dirs.len() - 1 {
-            if format {
-                let formatted_size = get_file_sizes(None, Some(total_size));
-                if dir_size >= threshold_value {
-                    format!("{:<10} {}", formatted_size.formatted, relative_path)
-                } else {
-                    String::new()
-                }
-            } else {
-                if dir_size >= threshold_value {
-                    format!("{:<10} {}", total_size, relative_path)
-                } else {
-                    String::new()
-                }
-            }
+        let formatted_output = if format {
+            format!(
+                "{:<10} {}",
+                get_file_sizes(None, Some(size_to_display)),
+                relative_path
+            )
         } else {
-            if format {
-                let formatted_size = get_file_sizes(None, Some(display_size));
-                if dir_size >= threshold_value {
-                    format!("{:<10} {}", formatted_size.formatted, relative_path)
-                } else {
-                    String::new()
-                }
-            } else {
-                if dir_size >= threshold_value {
-                    format!("{:<10} {}", display_size, relative_path)
-                } else {
-                    String::new()
-                }
-            }
+            format!("{:<10} {}", size_to_display, relative_path)
         };
 
-        if !formatted_output.is_empty() {
-            output_fn(&formatted_output);
-        }
+        output_fn(&formatted_output);
     }
 
     total_size
@@ -566,16 +463,16 @@ fn exclude_list(file: &Path) -> HashSet<FileContent> {
         if path.is_absolute() {
             if path.exists() && path.is_dir() {
                 hs.insert(FileContent::Path(path.to_path_buf()));
-            } else if trimmed_line.starts_with("*.") {
-                let extension = &trimmed_line[2..];
+            } else if let Some(stripped) = trimmed_line.strip_prefix("*.") {
+                let extension = stripped;
                 hs.insert(FileContent::Pattern(extension.to_string()));
             }
         } else {
             let full_path = current_dir.join(path);
             if full_path.exists() && full_path.is_dir() {
                 hs.insert(FileContent::Path(full_path));
-            } else if trimmed_line.starts_with("*.") {
-                let extension = &trimmed_line[2..];
+            } else if let Some(stripped) = trimmed_line.strip_prefix("*.") {
+                let extension = stripped;
                 hs.insert(FileContent::Pattern(extension.to_string()));
             }
         }
@@ -592,18 +489,18 @@ fn scan_directory_iter(
     let cd = current_dir == root_dir;
     let mut dir_stack = Vec::with_capacity(256);
     let mut dir_map = BTreeMap::new();
+    //let mut visited = std::collections::HashSet::new();
+    let mut visited = FxHashSet::default();
 
-    let root_dev = if let Some(_) = x_option {
+    let root_dev = if x_option.is_some() {
         Some(nix::sys::stat::stat(root_dir)?.st_dev)
     } else {
         None
     };
 
     let no_depth = max_depth == 0;
-    dir_stack.push((root_dir.to_path_buf(), 0));
+    dir_stack.push((root_dir.to_path_buf(), 0, false)); // false = not processed yet
 
-    let mut file_names = Vec::with_capacity(64);
-    let mut sub_dirs = Vec::with_capacity(64);
     let mut exclusion_paths = Vec::new();
     let mut exclusion_patterns = Vec::new();
 
@@ -616,9 +513,22 @@ fn scan_directory_iter(
         }
     }
 
-    while let Some((d_path, depth)) = dir_stack.pop() {
-        file_names.clear();
-        sub_dirs.clear();
+    while let Some((d_path, depth, processed)) = dir_stack.pop() {
+        if processed {
+            let dir_key = if cd {
+                PathBuf::from("./").join(d_path.strip_prefix(root_dir).unwrap_or(&d_path))
+            } else {
+                root_dir.join(d_path.strip_prefix(root_dir).unwrap_or(&d_path))
+            };
+            if let Some(files) = dir_map.remove(&d_path) {
+                dir_map.insert(dir_key, files);
+            }
+            continue;
+        }
+
+        let mut file_names = Vec::new();
+        dir_map.insert(d_path.clone(), Vec::new());
+        dir_stack.push((d_path.clone(), depth, true));
 
         if let Some(root_dev) = root_dev {
             let sub_dir_dev = nix::sys::stat::stat(&d_path)?.st_dev;
@@ -632,14 +542,12 @@ fn scan_directory_iter(
 
         for res in open_dir {
             let entry = res.map_err(|e| format!("Error reading directory {:?}: {}", d_path, e))?;
-
             let file_name = entry.file_name().to_str().unwrap_or("");
             if file_name == "." || file_name == ".." {
                 continue;
             }
 
             let full_path = d_path.join(file_name);
-
             if exclusion_paths.iter().any(|ex| full_path == *ex) {
                 continue;
             }
@@ -651,8 +559,8 @@ fn scan_directory_iter(
 
             match entry.file_type() {
                 Some(nix::dir::Type::Directory) => {
-                    if no_depth || depth < max_depth {
-                        sub_dirs.push((full_path.clone(), depth + 1));
+                    if no_depth || depth < max_depth && visited.insert(full_path.clone()) {
+                        dir_stack.push((full_path, depth + 1, false));
                     }
                 }
                 Some(nix::dir::Type::File) => {
@@ -662,13 +570,9 @@ fn scan_directory_iter(
             }
         }
 
-        let dir_key = if cd {
-            PathBuf::from("./").join(d_path.strip_prefix(root_dir).unwrap_or(&d_path))
-        } else {
-            root_dir.join(d_path.strip_prefix(root_dir).unwrap_or(&d_path))
-        };
-        dir_map.insert(dir_key, file_names.clone());
-        dir_stack.extend(sub_dirs.drain(..));
+        if let Some(files) = dir_map.get_mut(&d_path) {
+            files.extend(file_names);
+        }
     }
 
     Ok(dir_map)
@@ -723,13 +627,13 @@ fn main() -> Result<()> {
 
         if g_args.summarize {
             if g_args.human_readable {
-                println!("{:<10}  .", output.formatted);
+                println!("{:<10}  .", output);
             } else {
                 println!("{:<10} .", total_dir_size);
             }
         } else if g_args.total {
             if g_args.human_readable {
-                println!("{:<10} total", output.formatted);
+                println!("{:<10} total", output);
             } else {
                 println!("{:<10} total", total_dir_size);
             }
