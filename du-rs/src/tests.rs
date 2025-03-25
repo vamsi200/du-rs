@@ -141,7 +141,7 @@ mod tests {
         let expected_output = "\
 8K         test_env/test_dir2
 4K         test_env/test1
-24K        test_env/
+24K        test_env
 24K        ./
 ";
         assert_eq!(stdout.trim(), expected_output.trim());
@@ -159,7 +159,7 @@ mod tests {
         let expected_output = "\
 1M         test_env/test_dir2
 1M         test_env/test1
-1M         test_env/
+1M         test_env
 1M         ./
 ";
         assert_eq!(stdout.trim(), expected_output.trim());
@@ -177,7 +177,7 @@ mod tests {
         let expected_output = "\
 1G         test_env/test_dir2
 1G         test_env/test1
-1G         test_env/
+1G         test_env
 1G         ./
 ";
         assert_eq!(stdout.trim(), expected_output.trim());
@@ -196,7 +196,7 @@ mod tests {
         let expected_output = "\
 8          test_env/test_dir2
 4          test_env/test1
-24         test_env/
+24         test_env
 24         ./
 ";
         assert_eq!(stdout.trim(), expected_output.trim());
