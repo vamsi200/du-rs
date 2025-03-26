@@ -1,6 +1,7 @@
 use crate::stat::lstat;
 use fxhash::FxHashMap;
 use fxhash::FxHashSet;
+use indexmap::IndexMap;
 use nix::fcntl::OFlag;
 use nix::sys::stat;
 use nix::sys::stat::Mode;
@@ -11,6 +12,7 @@ use std::fmt::Write;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::exit;
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 struct FileStats {
@@ -29,18 +31,22 @@ impl FileStats {
         }
     }
 
+    #[inline(always)]
     fn size_in_bytes(&self) -> i64 {
         self.size
     }
 
+    #[inline(always)]
     fn disk_usage_blocks(&self) -> i64 {
         (self.blocks * 512) / 1024
     }
 
+    #[inline(always)]
     fn disk_usage_bytes(&self) -> i64 {
         self.blocks * 512
     }
 }
+
 const UNITS: [(&str, f64); 7] = [
     ("K", 1_024.0),
     ("M", 1_048_576.0),
@@ -67,33 +73,40 @@ fn parse_size_to_bytes(size_str: &str) -> Option<i64> {
 }
 
 fn get_file_sizes(file_path: Option<&Path>, bytes: Option<i64>) -> String {
-    let bytes = if let Some(path) = file_path {
-        stat::stat(path).map(|res| res.st_blocks * 512).unwrap_or(0)
-    } else {
-        bytes.unwrap_or(0)
-    };
+    let bytes = bytes.unwrap_or_else(|| {
+        file_path
+            .and_then(|path| stat::stat(path).ok())
+            .map_or(0, |res| res.st_blocks * 512)
+    });
+
+    let mut output = String::with_capacity(16);
 
     if bytes < 1024 {
-        return format!("{bytes}B");
+        write!(output, "{}B", bytes).unwrap();
+        return output;
     }
 
     let mut value = bytes as f64;
     let mut unit = "B";
 
-    for (u, div) in UNITS.iter() {
-        if bytes < (*div as i64) * 1024 {
+    for &(u, div) in UNITS.iter() {
+        if bytes < (div as i64) * 1024 {
             unit = u;
             value /= div;
             break;
         }
     }
 
-    format!("{:.1}{}", value, unit)
+    write!(output, "{:.1}{}", value, unit).unwrap();
+    output
 }
+
 //use Cow
 //use fxhash
+//add threshold
+//#[inline(always)]
 fn format_file_size<F>(
-    dir: &BTreeMap<PathBuf, Vec<PathBuf>>,
+    dir: &IndexMap<PathBuf, Vec<PathBuf>>,
     arg: &str,
     show_all: bool,
     threshold: String,
@@ -196,24 +209,24 @@ where
     Ok(formatted_total)
 }
 
-const fn select_dir_size_fn(is_bytes: bool, format: bool) -> fn(&FileStats) -> i64 {
-    match (is_bytes, format) {
-        (true, _) => |_| 0,
-        (false, true) => FileStats::disk_usage_bytes,
-        (false, false) => FileStats::disk_usage_blocks,
-    }
-}
-
-const fn select_file_size_fn(is_bytes: bool, format: bool) -> fn(&FileStats) -> i64 {
-    match (is_bytes, format) {
-        (true, _) => FileStats::size_in_bytes,
-        (false, true) => FileStats::disk_usage_bytes,
-        (false, false) => FileStats::disk_usage_blocks,
-    }
-}
+//const fn select_dir_size_fn(is_bytes: bool, format: bool) -> fn(&FileStats) -> i64 {
+//    match (is_bytes, format) {
+//        (true, _) => |_| 0,
+//        (false, true) => FileStats::disk_usage_bytes,
+//        (false, false) => FileStats::disk_usage_blocks,
+//    }
+//}
+//
+//const fn select_file_size_fn(is_bytes: bool, format: bool) -> fn(&FileStats) -> i64 {
+//    match (is_bytes, format) {
+//        (true, _) => FileStats::size_in_bytes,
+//        (false, true) => FileStats::disk_usage_bytes,
+//        (false, false) => FileStats::disk_usage_blocks,
+//    }
+//}
 
 fn calculate_total_dir_size<F>(
-    dir: &BTreeMap<PathBuf, Vec<PathBuf>>,
+    dir: &IndexMap<PathBuf, Vec<PathBuf>>,
     format: bool,
     is_bytes: bool,
     r_files: bool,
@@ -224,8 +237,25 @@ fn calculate_total_dir_size<F>(
 where
     F: std::io::Write,
 {
-    let get_dir_size = select_dir_size_fn(is_bytes, format);
-    let get_file_size = select_file_size_fn(is_bytes, format);
+    let get_dir_size = |stats: &FileStats| -> i64 {
+        if is_bytes {
+            0
+        } else if format {
+            stats.disk_usage_bytes()
+        } else {
+            stats.disk_usage_blocks()
+        }
+    };
+
+    let get_file_size = |stats: &FileStats| -> i64 {
+        if is_bytes {
+            stats.size_in_bytes()
+        } else if format {
+            stats.disk_usage_bytes()
+        } else {
+            stats.disk_usage_blocks()
+        }
+    };
 
     let c_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut dir_sizes: FxHashMap<&Path, i64> = FxHashMap::default();
@@ -245,16 +275,18 @@ where
             let file_stats = FileStats::from(file);
             let file_size = get_file_size(&file_stats);
 
-            if let Ok(metadata) = lstat(file) {
-                let inode = metadata.st_ino;
-                if l_arg || counted_inodes.insert(inode) {
+            if l_arg {
+                if let Ok(metadata) = lstat(file) {
+                    let inode = metadata.st_ino;
+                    counted_inodes.insert(inode);
                     total_size += file_size;
                 }
             }
             dir_size += file_size;
 
             if r_files && file_size >= threshold_value {
-                let relative_path = file.strip_prefix(&c_dir).unwrap_or(file);
+                //let relative_path = file.strip_prefix(&c_dir).unwrap_or(file);
+                let relative_path = file.strip_prefix(&c_dir).ok().unwrap_or(file);
                 let display_path: Cow<str> = if file.starts_with(&c_dir) {
                     let mut s = String::from("./");
                     s.push_str(relative_path.to_string_lossy().as_ref());
@@ -277,15 +309,16 @@ where
         dir_sizes.insert(dir_path, dir_size);
     }
     let mut sorted_dirs: Vec<_> = dir_sizes.keys().copied().collect();
-    sorted_dirs.sort_unstable_by(|a, b| b.cmp(a));
-
+    sorted_dirs.sort_unstable_by_key(|a| std::cmp::Reverse(a.as_os_str()));
     for &dir_path in &sorted_dirs {
         if let Some(parent) = dir_path.parent() {
-            let dir_size = *dir_sizes.get(dir_path).unwrap_or(&0);
-            *dir_sizes.entry(parent).or_insert(0) += dir_size;
+            if let Some(&dir_size) = dir_sizes.get(dir_path) {
+                *dir_sizes.entry(parent).or_insert(0) += dir_size;
+            }
         }
     }
-
+    use std::io::{BufWriter, Write};
+    let mut writer = BufWriter::new(output_fn);
     for &dir_path in &sorted_dirs {
         let dir_size = *dir_sizes.get(dir_path).unwrap_or(&0);
         if dir_size < threshold_value {
@@ -296,15 +329,12 @@ where
             Ok(rel) => Cow::Owned(rel.to_string_lossy().into_owned()),
             Err(_) => Cow::Borrowed(dir_path.to_str().unwrap_or("")),
         };
-
         let formatted_size = if format {
             get_file_sizes(None, Some(dir_size))
         } else {
             dir_size.to_string()
         };
-
-        writeln!(output_fn, "{:<10} {}", formatted_size, relative_path).unwrap();
-        output_fn.flush().unwrap();
+        writeln!(writer, "{:<10} {}", formatted_size, relative_path).unwrap();
     }
     total_size
 }
@@ -469,17 +499,16 @@ fn scan_directory_iter(
     max_depth: i32,
     x_option: Option<&Path>,
     is_exclude: Option<&Path>,
-) -> Result<BTreeMap<PathBuf, Vec<PathBuf>>> {
+) -> Result<IndexMap<PathBuf, Vec<PathBuf>>> {
+    use indexmap::IndexMap;
     use nix::dir::Dir;
     use nix::fcntl::OFlag;
     use nix::sys::stat::Mode;
-    use std::collections::BTreeMap;
     use std::ffi::OsStr;
-
     let current_dir = env::current_dir()?;
     let cd = current_dir == root_dir;
     let mut dir_stack = Vec::with_capacity(256);
-    let mut dir_map = BTreeMap::new();
+    let mut dir_map = IndexMap::new();
     let mut visited = FxHashSet::default();
 
     let root_dev = if x_option.is_some() {
@@ -508,7 +537,7 @@ fn scan_directory_iter(
         root_dir.to_path_buf()
     };
     dir_stack.push((root_dir.to_path_buf(), initial_dir_key, 0));
-
+    let use_exclusion = is_exclude.is_some();
     while let Some((absolute_path, dir_key, depth)) = dir_stack.pop() {
         if let Some(root_dev) = root_dev {
             let sub_dir_dev = nix::sys::stat::stat(&absolute_path)?.st_dev;
@@ -519,49 +548,54 @@ fn scan_directory_iter(
 
         let mut file_names = Vec::new();
         let mut subdirs = Vec::new();
-
-        let open_dir = Dir::open(&absolute_path, OFlag::O_RDONLY, Mode::empty())
-            .map_err(|e| format!("Failed to open {:?}: {}", absolute_path, e))?;
-
-        for entry in open_dir {
-            let entry =
-                entry.map_err(|e| format!("Error reading directory {:?}: {}", absolute_path, e))?;
-            let file_name = entry.file_name();
-            let file_name_str = file_name.to_str().unwrap_or("");
-            if file_name_str == "." || file_name_str == ".." {
-                continue;
-            }
-
-            let full_path = absolute_path.join(file_name_str);
-
-            if exclusion_paths.contains(&full_path) {
-                continue;
-            }
-            if let Some(ext) = full_path.extension() {
-                if exclusion_patterns.contains(ext) {
+        // to reduce syscalls and reuse fd
+        let open_dir =
+            if let Ok(fd) = nix::fcntl::open(&absolute_path, OFlag::O_RDONLY, Mode::empty()) {
+                Some(Dir::from_fd(fd)?)
+            } else {
+                None
+            };
+        if let Some(open_dir) = open_dir {
+            for entry in open_dir {
+                let entry = entry
+                    .map_err(|e| format!("Error reading directory {:?}: {}", absolute_path, e))?;
+                let file_name = entry.file_name();
+                let file_name_str = file_name.to_str().unwrap_or("");
+                if file_name_str == "." || file_name_str == ".." {
                     continue;
                 }
-            }
 
-            match entry.file_type() {
-                Some(nix::dir::Type::Directory) => {
-                    if !no_depth && depth >= max_depth {
+                let full_path = absolute_path.join(file_name_str);
+                if use_exclusion {
+                    if exclusion_paths.contains(&full_path)
+                        || full_path
+                            .extension()
+                            .map_or(false, |ext| exclusion_patterns.contains(ext))
+                    {
                         continue;
                     }
-                    if visited.insert(full_path.to_owned()) {
-                        let mut new_dir_key = dir_key.to_owned();
-                        new_dir_key.push(file_name_str);
-                        subdirs.push((full_path, new_dir_key, depth + 1));
+                }
+
+                match entry.file_type() {
+                    Some(nix::dir::Type::Directory) => {
+                        if !no_depth && depth >= max_depth {
+                            continue;
+                        }
+                        if visited.insert(full_path.to_owned()) {
+                            let mut new_dir_key = dir_key.to_owned(); //to_owned seems to be more performant
+                            new_dir_key.push(file_name_str);
+                            subdirs.push((full_path, new_dir_key, depth + 1));
+                        }
                     }
+                    Some(nix::dir::Type::File) => {
+                        file_names.push(full_path);
+                    }
+                    _ => {}
                 }
-                Some(nix::dir::Type::File) => {
-                    file_names.push(full_path);
-                }
-                _ => {}
             }
         }
 
-        for (abs_path, key, depth) in subdirs.into_iter().rev() {
+        while let Some((abs_path, key, depth)) = subdirs.pop() {
             dir_stack.push((abs_path, key, depth));
         }
 
@@ -573,13 +607,14 @@ fn scan_directory_iter(
 #[cfg(test)]
 mod tests;
 fn main() -> Result<()> {
+    use std::io::Write;
     let g_args = handle_args();
-    let mut output_size = std::io::stdout().lock();
-    let base_dir = g_args.x.clone().unwrap_or_else(|| g_args.path.clone());
+    let mut output_size = std::io::BufWriter::new(std::io::stdout().lock());
+    let base_dir = g_args.x.as_ref().unwrap_or(&g_args.path);
     let depth = g_args.depth.unwrap_or(0);
 
     let dir_map = scan_directory_iter(
-        &base_dir,
+        base_dir,
         depth,
         g_args.x.as_deref(),
         g_args.xclude.as_deref(),
@@ -593,13 +628,13 @@ fn main() -> Result<()> {
             g_args.threshold.unwrap_or_default(),
             |l| {
                 if !g_args.summarize && depth != -1 {
-                    println!("{}", l);
+                    writeln!(output_size, "{}", l).unwrap();
                 }
             },
         )?;
 
         if g_args.summarize {
-            println!("{:<10}  .", output);
+            writeln!(output_size, "{:<10}  .", output).unwrap();
         }
     } else {
         let total_dir_size = calculate_total_dir_size(
@@ -614,20 +649,18 @@ fn main() -> Result<()> {
 
         let output = get_file_sizes(None, Some(total_dir_size));
 
-        if g_args.summarize {
-            if g_args.human_readable {
-                println!("{:<10}  .", output);
+        if g_args.summarize || g_args.total {
+            let label = if g_args.summarize { "." } else { "total" };
+            let size_display = if g_args.human_readable {
+                output
             } else {
-                println!("{:<10} .", total_dir_size);
-            }
-        } else if g_args.total {
-            if g_args.human_readable {
-                println!("{:<10} total", output);
-            } else {
-                println!("{:<10} total", total_dir_size);
-            }
+                total_dir_size.to_string()
+            };
+
+            writeln!(output_size, "{:<10} {}", size_display, label).unwrap();
         }
     }
 
+    output_size.flush().unwrap();
     Ok(())
 }
