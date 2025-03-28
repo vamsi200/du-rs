@@ -1,10 +1,8 @@
 - Handle Paths when given as an argument. -- DONE
-- There are Inconsistencies in the calculations of the Directory Totals -- > [!IMPORTANT]
-- Handle all the arguments.
+- There are Inconsistencies in the calculations of the Directory Totals -- > Fixed i guess
+- Handle all the arguments. - most of them
 - Logging?
-- Add Rayon?
+- Add Rayon? - DONE
 - Handle Errors properly
-
-
-Last:
-- Optimize the code.
+- use anyhow
+- add comments
