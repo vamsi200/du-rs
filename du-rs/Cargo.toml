@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1.0.97"
+dashmap = "6.1.0"
+fxhash = "0.2.1"
+indexmap = { version = "2.8", features = ["rayon"] }
 nix = {version = "0.29.0", features = ["dir", "fs"]}
 rayon = "1.10.0"
 
