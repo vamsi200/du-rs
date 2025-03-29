@@ -253,8 +253,33 @@ fn format_file_size(
         &total_size,
     )?;
 
-    Ok(format_size(total_size.load(Ordering::Relaxed), arg)?)
+    format_size(total_size.load(Ordering::Relaxed), arg)
 }
+#[derive(Debug, Clone)]
+enum SizeFormat {
+    Bytes,
+    HumanReadable,
+    Blocks,
+}
+
+impl SizeFormat {
+    fn get_dir_size(&self, stats: &FileStats) -> i64 {
+        match self {
+            SizeFormat::Bytes => 0,
+            SizeFormat::HumanReadable => stats.disk_usage_bytes(),
+            SizeFormat::Blocks => stats.disk_usage_blocks(),
+        }
+    }
+
+    fn get_file_size(&self, stats: &FileStats) -> i64 {
+        match self {
+            SizeFormat::Bytes => stats.size_in_bytes(),
+            SizeFormat::HumanReadable => stats.disk_usage_bytes(),
+            SizeFormat::Blocks => stats.disk_usage_blocks(),
+        }
+    }
+}
+
 fn calculate_directory_size_default(
     dir: &IndexMap<PathBuf, Vec<PathBuf>>,
     format: bool,
@@ -264,24 +289,12 @@ fn calculate_directory_size_default(
     l_arg: bool,
     output_sender: Arc<Mutex<std::sync::mpsc::Sender<String>>>,
 ) -> i64 {
-    let get_dir_size = |stats: &FileStats| -> i64 {
-        if is_bytes {
-            0
-        } else if format {
-            stats.disk_usage_bytes()
-        } else {
-            stats.disk_usage_blocks()
-        }
-    };
-
-    let get_file_size = |stats: &FileStats| -> i64 {
-        if is_bytes {
-            stats.size_in_bytes()
-        } else if format {
-            stats.disk_usage_bytes()
-        } else {
-            stats.disk_usage_blocks()
-        }
+    let size_format = if is_bytes {
+        SizeFormat::Bytes
+    } else if format {
+        SizeFormat::HumanReadable
+    } else {
+        SizeFormat::Blocks
     };
 
     let c_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -297,14 +310,15 @@ fn calculate_directory_size_default(
     let dir_sizes = DashMap::new();
 
     dir.par_iter().for_each(|(dir_path, file_names)| {
-        let initial_dir_size = get_dir_size(&FileStats::from(dir_path));
+        let dir_stats = FileStats::from(dir_path);
+        let initial_dir_size = size_format.get_dir_size(&dir_stats);
         total_size.fetch_add(initial_dir_size, Ordering::Relaxed);
 
         let file_sizes_sum = file_names
             .par_iter()
             .map(|file| {
                 let file_stats = FileStats::from(file);
-                let file_size = get_file_size(&file_stats);
+                let file_size = size_format.get_file_size(&file_stats);
 
                 if l_arg {
                     if let Ok(metadata) = lstat(file) {
@@ -553,7 +567,7 @@ fn scan_directory_iter(
     let mut dir_map = IndexMap::new();
     let mut visited = FxHashSet::default();
 
-    let root_dev = if let Some(_) = x_option {
+    let root_dev = if x_option.is_some() {
         Some(
             nix::sys::stat::stat(root_dir)
                 .context("Failed to get device ID of root directory")?
