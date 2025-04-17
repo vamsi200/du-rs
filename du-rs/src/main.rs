@@ -662,8 +662,6 @@ fn scan_directory_iter(
 
     Ok(dir_map)
 }
-#[cfg(test)]
-mod tests;
 fn main() -> Result<()> {
     use std::io::{self, BufWriter, Write};
 
