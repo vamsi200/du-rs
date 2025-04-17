@@ -702,7 +702,7 @@ fn main() -> Result<()> {
         )
         .unwrap();
 
-        if g_args.summarize {
+        if g_args.summarize || g_args.total {
             shared_output
                 .lock()
                 .unwrap()
