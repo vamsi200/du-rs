@@ -76,7 +76,7 @@ This implementation uses Rust's standard library and the `nix` crate to interact
 # Run below command to clone and build
 curl -H "Cache-Control: no-cache" -s https://raw.githubusercontent.com/vamsi200/du-rs/main/build.sh | bash
 # Run the executable
-./target/release/du-rs
+du-rs/target/release/du-rs
 ```
 
 ## Dependencies
