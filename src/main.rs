@@ -667,8 +667,11 @@ fn main() -> Result<()> {
 
     let g_args = handle_args();
 
-    let (tx, rx) = mpsc::channel();
-    let shared_output = Arc::new(Mutex::new(tx));
+    let (b_tx, b_rx) = mpsc::channel();
+    let (d_tx, d_rx) = mpsc::channel();
+
+    let b_output = Arc::new(Mutex::new(b_tx));
+    let d_output = Arc::new(Mutex::new(d_tx));
 
     let base_dir = g_args.x.as_ref().unwrap_or(&g_args.path);
     let depth = g_args.depth.unwrap_or(0);
@@ -680,32 +683,50 @@ fn main() -> Result<()> {
         g_args.xclude.as_deref(),
     )?;
 
-    let output_thread = std::thread::spawn(move || {
-        let mut output = BufWriter::new(io::stdout().lock());
-        for line in rx {
-            if writeln!(output, "{}", line).is_err() {
-                break;
+    let b_thread = if !g_args.summarize {
+        Some(std::thread::spawn(move || {
+            let mut output = BufWriter::new(io::stdout().lock());
+            for line in b_rx {
+                if writeln!(output, "{}", line).is_err() {
+                    break;
+                }
             }
-        }
-        let _ = output.flush();
-    });
+            let _ = output.flush();
+        }))
+    } else {
+        None
+    };
+    let d_thread = if !g_args.summarize {
+        Some(std::thread::spawn(move || {
+            let mut output = BufWriter::new(io::stdout().lock());
+            for line in d_rx {
+                if writeln!(output, "{}", line).is_err() {
+                    break;
+                }
+            }
+            let _ = output.flush();
+        }))
+    } else {
+        None
+    };
 
     if !g_args.block_size.is_empty() {
-        format_file_size(
+        let s = format_file_size(
             &dir_map,
             &g_args.block_size,
             g_args.a,
             g_args.threshold.unwrap_or_default(),
-            shared_output.clone(),
+            b_output.clone(),
         )
         .unwrap();
-
-        if g_args.summarize || g_args.total {
-            shared_output
+        if g_args.total {
+            b_output
                 .lock()
                 .unwrap()
                 .send(format!("{:<10}  .", " "))
                 .unwrap();
+        } else if g_args.summarize {
+            println!("{:<10}.", s);
         }
     } else {
         let total_dir_size = calculate_directory_size_default(
@@ -715,27 +736,31 @@ fn main() -> Result<()> {
             g_args.a,
             g_args.threshold.unwrap_or_default(),
             g_args.l,
-            shared_output.clone(),
+            d_output.clone(),
         );
-
         if g_args.summarize || g_args.total {
             let output = get_file_sizes(None, Some(total_dir_size));
             let label = if g_args.summarize { "." } else { "total" };
-            let size_display = if g_args.human_readable {
-                output
-            } else {
-                total_dir_size.to_string()
-            };
-            shared_output
-                .lock()
-                .unwrap()
-                .send(format!("{:<10} {}", size_display, label))
-                .unwrap();
+            if g_args.total {
+                d_output
+                    .lock()
+                    .unwrap()
+                    .send(format!("{:<10} {label}", total_dir_size))
+                    .unwrap();
+            } else if g_args.summarize {
+                println!("{:<10}{label}", total_dir_size)
+            } else if g_args.summarize && g_args.human_readable {
+                println!("{:<10}{label}", output)
+            }
         }
     }
-
-    drop(shared_output);
-    output_thread.join().unwrap();
-
+    drop(b_output);
+    drop(d_output);
+    if let Some(handle) = b_thread {
+        handle.join().unwrap();
+    }
+    if let Some(handle) = d_thread {
+        handle.join().unwrap();
+    }
     Ok(())
 }
