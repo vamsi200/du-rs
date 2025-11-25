@@ -1,25 +1,18 @@
-use crate::stat::lstat;
-use dashmap::DashMap;
-use fxhash::{FxHashMap, FxHashSet};
-use indexmap::IndexMap;
-use nix::dir::Dir;
+#![allow(unused_variables)]
+#![allow(dead_code)]
+
+use fxhash::FxHashSet;
 use nix::{
     fcntl::OFlag,
     sys::stat::{self, Mode},
 };
-use rayon::prelude::*;
-use std::ffi::OsStr;
+use std::io::{BufWriter, Write};
 use std::{
     collections::{HashMap, HashSet},
     env,
-    fmt::Write,
     os::fd::RawFd,
     path::{Path, PathBuf},
     process::exit,
-    sync::{
-        atomic::{AtomicI64, Ordering},
-        mpsc, Arc, Mutex,
-    },
 };
 
 type Cresult<T> = anyhow::Result<T, anyhow::Error>;
@@ -30,7 +23,7 @@ struct FileStats {
 }
 
 impl FileStats {
-    fn from(path: &PathBuf) -> Self {
+    fn from(path: &Path) -> Self {
         match stat::stat(path) {
             Ok(res) => Self {
                 size: res.st_size,
@@ -79,6 +72,7 @@ fn parse_size_to_bytes(size_str: &str) -> Option<i64> {
 }
 
 fn get_file_sizes(file_path: Option<&Path>, bytes: Option<i64>) -> String {
+    use std::fmt::Write;
     let bytes = bytes.unwrap_or_else(|| {
         file_path
             .and_then(|path| stat::stat(path).ok())
@@ -147,128 +141,88 @@ impl SizeFormat {
     }
 }
 
-fn calculate_directory_sizes<'a>(
-    dir: &'a IndexMap<PathBuf, Vec<PathBuf>>,
-    show_all: bool,
+fn calculate_directory_sizes(
+    dir_path: &Path,
+    files: &[PathBuf],
+    list_files: bool,
+    summarize: bool,
     threshold_value: i64,
-    c_dir: &'a Path,
-    output_sender: &'a Arc<Mutex<std::sync::mpsc::Sender<String>>>,
-    total_size: &'a AtomicI64,
+    c_dir: &Path,
+    writer: &mut BufWriter<std::io::Stdout>,
+    seen_inodes: &mut FxHashSet<(u64, u64)>,
+    count_links: bool,
     arg: &str,
-) -> Cresult<()> {
-    let dir_sizes: DashMap<&Path, i64> = DashMap::new();
+) -> Cresult<i64> {
     let size_format = SizeFormat::HumanReadable;
-    dir.par_iter().for_each(|(dir_path, files)| {
-        let dir_size = size_format.get_dir_size(&FileStats::from(dir_path));
-        total_size.fetch_add(dir_size, Ordering::Relaxed);
-        let file_size_sum = files
-            .par_iter()
-            .map(|file| {
-                let file_size = size_format.get_file_size(&FileStats::from(file));
 
-                total_size.fetch_add(file_size, Ordering::Relaxed);
-                if show_all && file_size >= threshold_value {
-                    if let Ok(formatted_file_size) = format_size(file_size, arg) {
-                        let relative_path = file.strip_prefix(c_dir).unwrap_or(file);
-                        let display_path = if file.starts_with(&c_dir) {
-                            format!("./{}", relative_path.to_string_lossy())
-                        } else {
-                            relative_path.to_string_lossy().into_owned()
-                        };
+    let dir_stats = FileStats::from(dir_path);
+    let initial_dir_size = size_format.get_dir_size(&dir_stats);
+    let mut total_size = initial_dir_size;
 
-                        let line = format!("{:<10} {}", formatted_file_size, display_path);
-                        output_sender.lock().unwrap().send(line).unwrap();
-                    } else {
-                        panic!("her");
-                    }
-                }
-                file_size
-            })
-            .sum::<i64>();
+    for file in files {
+        let meta = match stat::stat(file) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
 
-        dir_sizes.insert(dir_path.as_path(), dir_size + file_size_sum);
-    });
-
-    let mut sorted_dirs: Vec<_> = dir_sizes.iter().map(|entry| *entry.key()).collect();
-    if sorted_dirs.len() < 10_000 {
-        sorted_dirs.sort_unstable_by_key(|a| std::cmp::Reverse(a.as_os_str()));
-    } else {
-        sorted_dirs.par_sort_unstable_by_key(|a| std::cmp::Reverse(a.as_os_str()));
-    }
-    let mut dir_sizes_map: FxHashMap<&Path, i64> = dir_sizes.into_iter().collect();
-
-    for dir_path in &sorted_dirs {
-        if let Some(parent) = dir_path.parent() {
-            if let Some(&dir_size) = dir_sizes_map.get(dir_path) {
-                *dir_sizes_map.entry(parent).or_insert(0) += dir_size;
+        if !count_links && meta.st_nlink > 1 {
+            let inode = (meta.st_dev as u64, meta.st_ino as u64);
+            if !seen_inodes.insert(inode) {
+                continue;
             }
+        }
+
+        let file_stats = FileStats {
+            size: meta.st_size,
+            blocks: meta.st_blocks,
+        };
+        let file_size = size_format.get_file_size(&file_stats);
+
+        total_size += file_size;
+
+        if list_files && !summarize && file_size >= threshold_value {
+            let formatted_file_size = format_size(file_size, arg)?;
+            let relative_path = file.strip_prefix(c_dir).unwrap_or(file);
+            let display_path = if file.starts_with(c_dir) {
+                format!("./{}", relative_path.to_string_lossy())
+            } else {
+                relative_path.to_string_lossy().into_owned()
+            };
+
+            writeln!(writer, "{:<10} {}", formatted_file_size, display_path).unwrap();
         }
     }
 
-    let mut output_buffer = String::new();
-    for dir_path in sorted_dirs {
-        if let Some(&dir_size) = dir_sizes_map.get(dir_path) {
-            let dir_relative_path = dir_path.strip_prefix(c_dir).unwrap_or(dir_path);
-            if dir_relative_path != Path::new(".") && dir_size >= threshold_value {
-                output_buffer.clear();
-                let formatted_dir_size = format_size(dir_size, arg)?;
-                write!(
-                    output_buffer,
-                    "{:<10} {}",
-                    formatted_dir_size,
-                    dir_relative_path.display()
-                )
-                .map_err(|e| format!("Failed to write to buffer: {}", e))
-                .unwrap();
-                let _ = output_sender.lock().unwrap().send(output_buffer.clone());
-            }
+    if !summarize && total_size >= threshold_value {
+        let formatted_dir_size = format_size(total_size, arg)?;
+        let dir_relative_path = dir_path.strip_prefix(c_dir).unwrap_or(dir_path);
+
+        if dir_relative_path != Path::new(".") {
+            writeln!(
+                writer,
+                "{:<10} {}",
+                formatted_dir_size,
+                dir_relative_path.display()
+            )
+            .unwrap();
         }
     }
 
-    let formatted_total = format_size(total_size.load(Ordering::Relaxed), arg)?;
-    output_sender
-        .lock()
-        .unwrap()
-        .send(format!("{:<10} ./", formatted_total))
-        .unwrap();
-
-    Ok(())
+    Ok(total_size)
 }
 
-fn format_file_size(
-    dir: &IndexMap<PathBuf, Vec<PathBuf>>,
-    arg: &str,
-    show_all: bool,
-    threshold: String,
-    output_sender: Arc<Mutex<std::sync::mpsc::Sender<String>>>,
-) -> Cresult<String> {
-    let threshold_value = parse_size_to_bytes(&threshold).unwrap_or(0);
-    let c_dir = env::current_dir()
-        .map_err(|e| format!("Failed to get current directory: {}", e))
-        .unwrap();
-    let total_size = AtomicI64::new(0);
-
-    if let Ok(_) = calculate_directory_sizes(
-        dir,
-        show_all,
-        threshold_value,
-        &c_dir,
-        &output_sender,
-        &total_size,
-        arg,
-    ) {
-        format_size(total_size.load(Ordering::Relaxed), arg)
-    } else {
-        format_size(total_size.load(Ordering::Relaxed), arg)
-    }
-}
-fn calculate_directory_size_default(
-    dir: &IndexMap<PathBuf, Vec<PathBuf>>,
+pub fn calculate_directory_size_default(
+    dir_path: &Path,
+    files: &[PathBuf],
     format: bool,
     is_bytes: bool,
-    r_files: bool,
-    threshold: String,
-    output_sender: Arc<Mutex<std::sync::mpsc::Sender<String>>>,
+    summarize: bool,
+    list_files: bool,
+    threshold_size: i64,
+    count_links: bool,
+    writer: &mut BufWriter<std::io::Stdout>,
+    seen_inodes: &mut FxHashSet<(u64, u64)>,
+    current_dir: &Path,
 ) -> i64 {
     let size_format = if is_bytes {
         SizeFormat::Bytes
@@ -278,104 +232,79 @@ fn calculate_directory_size_default(
         SizeFormat::Blocks
     };
 
-    let c_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let threshold_value = parse_size_to_bytes(&threshold).unwrap_or(0);
-    let threshold = if !is_bytes && !format {
-        threshold_value / 1024
-    } else {
-        threshold_value
-    };
+    let dir_stats = FileStats::from(&dir_path);
+    let initial_dir_size = size_format.get_dir_size(&dir_stats);
+    let mut total_size = initial_dir_size;
 
-    let total_size = AtomicI64::new(0);
-    let counted_inodes = Arc::new(Mutex::new(FxHashSet::default()));
-    let dir_sizes = DashMap::new();
+    for file in files {
+        let meta = match stat::stat(file) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
 
-    dir.iter().for_each(|(dir_path, file_names)| {
-        let dir_stats = FileStats::from(dir_path);
-        let initial_dir_size = size_format.get_dir_size(&dir_stats);
-        total_size.fetch_add(initial_dir_size, Ordering::Relaxed);
-        let file_sizes_sum = file_names
-            .par_iter()
-            .map(|file| {
-                let file_stats = FileStats::from(file);
-                let file_size = size_format.get_file_size(&file_stats);
+        if !count_links && meta.st_nlink > 1 {
+            let inode = (meta.st_dev as u64, meta.st_ino as u64);
+            if !seen_inodes.insert(inode) {
+                continue;
+            }
+        }
 
-                if let Ok(metadata) = lstat(file) {
-                    let inode = metadata.st_ino;
-                    let mut counted = counted_inodes.lock().unwrap();
-                    if counted.insert(inode) {
-                        total_size.fetch_add(file_size, Ordering::Relaxed);
-                    }
+        let file_stats = FileStats {
+            size: meta.st_size,
+            blocks: meta.st_blocks,
+        };
+        let file_size = size_format.get_file_size(&file_stats);
+
+        total_size += file_size;
+
+        if list_files && !summarize && file_size >= threshold_size {
+            let relative_display = match file.strip_prefix(current_dir) {
+                Ok(rel) => rel.to_string_lossy(),
+                Err(_) => file.to_string_lossy(),
+            };
+
+            if format {
+                let formatted_size = get_file_sizes(None, Some(file_size));
+                if file.starts_with(current_dir) {
+                    writeln!(writer, "{:<10} ./{}", formatted_size, relative_display).unwrap();
+                } else {
+                    writeln!(writer, "{:<10} {}", formatted_size, relative_display).unwrap();
                 }
-
-                if r_files && file_size >= threshold {
-                    let relative_path = file.strip_prefix(&c_dir).unwrap_or(file);
-                    let display_path = if file.starts_with(&c_dir) {
-                        format!("./{}", relative_path.to_string_lossy())
-                    } else {
-                        relative_path.to_string_lossy().into_owned()
-                    };
-
-                    let formatted_size = if format {
-                        get_file_sizes(None, Some(file_size))
-                    } else {
-                        file_size.to_string()
-                    };
-
-                    let line = format!("{:<10} {}", formatted_size, display_path);
-                    output_sender.lock().unwrap().send(line).unwrap();
+            } else {
+                if file.starts_with(current_dir) {
+                    writeln!(writer, "{:<10} ./{}", file_size, relative_display).unwrap();
+                } else {
+                    writeln!(writer, "{:<10} {}", file_size, relative_display).unwrap();
                 }
-
-                file_size
-            })
-            .sum::<i64>();
-
-        dir_sizes.insert(dir_path.as_path(), initial_dir_size + file_sizes_sum);
-    });
-
-    // converting DashMap to FxHashMap for sequential processing
-    let dir_sizes: FxHashMap<_, _> = dir_sizes
-        .into_read_only()
-        .iter()
-        .map(|(k, v)| (*k, *v))
-        .collect();
-
-    // Update parent directories
-    let mut sorted_dirs: Vec<_> = dir_sizes.keys().cloned().collect();
-    sorted_dirs.par_sort_unstable_by_key(|a| std::cmp::Reverse(a.as_os_str()));
-
-    let mut dir_sizes = dir_sizes;
-    for dir_path in &sorted_dirs {
-        if let Some(parent) = dir_path.parent() {
-            if let Some(&dir_size) = dir_sizes.get(dir_path) {
-                *dir_sizes.entry(parent).or_insert(0) += dir_size;
             }
         }
     }
 
-    for dir_path in &sorted_dirs {
-        let dir_size = *dir_sizes.get(dir_path).unwrap_or(&0);
-        if dir_size < threshold {
-            continue;
-        }
-
-        let relative_path = match dir_path.strip_prefix(&c_dir) {
-            Ok(rel) => rel.to_string_lossy().into_owned(),
-            Err(_) => dir_path.to_str().unwrap_or("").to_string(),
+    if !summarize && total_size >= threshold_size {
+        let relative_display = match dir_path.strip_prefix(current_dir) {
+            Ok(rel) => rel.to_string_lossy(),
+            Err(_) => dir_path.to_string_lossy(),
         };
 
-        let formatted_size = if format {
-            get_file_sizes(None, Some(dir_size))
+        if format {
+            let formatted_size = get_file_sizes(None, Some(total_size));
+            if dir_path.starts_with(current_dir) {
+                writeln!(writer, "{:<10} ./{}", formatted_size, relative_display).unwrap();
+            } else {
+                writeln!(writer, "{:<10} {}", formatted_size, relative_display).unwrap();
+            }
         } else {
-            dir_size.to_string()
-        };
-
-        let line = format!("{:<10} {}", formatted_size, relative_path);
-        output_sender.lock().unwrap().send(line).unwrap();
+            if dir_path.starts_with(current_dir) {
+                writeln!(writer, "{:<10} ./{}", total_size, relative_display).unwrap();
+            } else {
+                writeln!(writer, "{:<10} {}", total_size, relative_display).unwrap();
+            }
+        }
     }
 
-    total_size.into_inner()
+    total_size
 }
+
 fn print_help() {
     println!(
         "Usage: du-rs [OPTIONS] [PATH]
@@ -395,7 +324,7 @@ Options:
     exit(0);
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Args {
     path: PathBuf,
     human_readable: bool,
@@ -538,23 +467,44 @@ fn exclude_list(file: &Path) -> HashSet<FileContent> {
     }
     hs
 }
+
 fn scan_directory_iter(
     root_dir: &Path,
     max_depth: i32,
     x_option: Option<&Path>,
     is_exclude: Option<&Path>,
     count_links: bool,
-) -> Result<IndexMap<PathBuf, Vec<PathBuf>>> {
+    args: Args,
+) -> Result<i64> {
+    use fxhash::FxHashSet;
+    use nix::dir::Dir;
+    use nix::fcntl::{open, OFlag};
+    use nix::sys::stat::{fstat, stat, Mode};
+    use std::env;
+    use std::ffi::OsStr;
+    use std::io::{stdout, BufWriter};
     use std::os::unix::ffi::OsStrExt;
+
     let current_dir = env::current_dir().context("Failed to get current directory")?;
     let cd = current_dir == root_dir;
-    let mut dir_stack = IndexMap::new();
-    let mut dir_map = IndexMap::new();
+
+    let mut dir_stack: Vec<(PathBuf, PathBuf, i32)> = Vec::with_capacity(256);
     let mut visited_dirs = FxHashSet::default();
     let mut seen_inodes: FxHashSet<(u64, u64)> = FxHashSet::default();
+    let threshold = args.threshold.as_deref().unwrap_or("0");
+
+    let threshold_value = parse_size_to_bytes(threshold).unwrap_or(0);
+    let threshold_size = if args.bytes {
+        threshold_value
+    } else if args.human_readable {
+        threshold_value
+    } else {
+        threshold_value / 1024
+    };
+
     let root_dev = if x_option.is_some() {
         Some(
-            nix::sys::stat::stat(root_dir)
+            stat(root_dir)
                 .context("Failed to get device ID of root directory")?
                 .st_dev,
         )
@@ -567,15 +517,18 @@ fn scan_directory_iter(
     let mut exclusion_paths = FxHashSet::default();
     let mut exclusion_patterns = FxHashSet::default();
     if let Some(exclude_path) = is_exclude {
-        for s in exclude_list(exclude_path) {
+        for s in crate::exclude_list(exclude_path) {
             match s {
-                FileContent::Path(p) => exclusion_paths.insert(p),
-                FileContent::Pattern(pt) => {
-                    exclusion_patterns.insert(OsStr::new(&pt).to_os_string())
+                FileContent::Path(p) => {
+                    exclusion_paths.insert(p);
                 }
-            };
+                FileContent::Pattern(pt) => {
+                    exclusion_patterns.insert(OsStr::new(&pt).to_os_string());
+                }
+            }
         }
     }
+    let use_exclusion = is_exclude.is_some();
 
     let initial_dir_key = if cd {
         PathBuf::from("./")
@@ -583,195 +536,158 @@ fn scan_directory_iter(
         root_dir.to_path_buf()
     };
 
-    dir_stack.insert(root_dir.to_path_buf(), (initial_dir_key, 0));
-    let use_exclusion = is_exclude.is_some();
-    while let Some((absolute_path, (dir_key, depth))) = dir_stack.pop() {
+    dir_stack.push((root_dir.to_path_buf(), initial_dir_key, 0));
+    let mut writer = BufWriter::new(stdout());
+    let mut total_size = 0;
+    while let Some((absolute_path, dir_key, depth)) = dir_stack.pop() {
+        let fd = match open(
+            &absolute_path,
+            OFlag::O_DIRECTORY | OFlag::O_RDONLY,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(_) => continue,
+        };
+
+        let dir_meta = match fstat(fd) {
+            Ok(m) => m,
+            Err(_) => {
+                let _ = nix::unistd::close(fd);
+                continue;
+            }
+        };
+
         if let Some(root_dev) = root_dev {
-            let sub_dir_dev = nix::sys::stat::stat(&absolute_path)
-                .with_context(|| format!("Failed to stat {:?}", absolute_path))?
-                .st_dev;
-            if root_dev != sub_dir_dev {
+            if dir_meta.st_dev != root_dev {
+                let _ = nix::unistd::close(fd);
                 continue;
             }
         }
 
-        let mut file_names = Vec::new();
-        let mut subdirs = IndexMap::new();
+        let open_dir = match Dir::from_fd(fd) {
+            Ok(d) => d,
+            Err(_) => {
+                let _ = nix::unistd::close(fd);
+                continue;
+            }
+        };
 
-        let open_dir = nix::fcntl::open(&absolute_path, OFlag::O_RDONLY, Mode::empty())
-            .ok()
-            .and_then(|fd| Dir::from_fd(fd).ok());
+        let mut file_names: Vec<PathBuf> = Vec::with_capacity(64);
+        let mut subdirs: Vec<(PathBuf, PathBuf, i32)> = Vec::with_capacity(16);
 
-        if let Some(open_dir) = open_dir {
-            for entry in open_dir {
-                let entry = entry
-                    .with_context(|| format!("Error reading directory {:?}", absolute_path))?;
-                let file_name_os_str = OsStr::from_bytes(entry.file_name().to_bytes());
+        for entry_res in open_dir {
+            let entry = match entry_res {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
 
-                if file_name_os_str == "." || file_name_os_str == ".." {
+            let name_bytes = entry.file_name().to_bytes();
+            if name_bytes == b"." || name_bytes == b".." {
+                continue;
+            }
+
+            let file_name_os_str = OsStr::from_bytes(name_bytes);
+            let full_path = absolute_path.join(file_name_os_str);
+
+            if use_exclusion {
+                if exclusion_paths.contains(&full_path) {
                     continue;
                 }
-
-                let full_path = absolute_path.join(file_name_os_str);
-                if use_exclusion
-                    && (exclusion_paths.contains(&full_path)
-                        || full_path
-                            .extension()
-                            .map_or(false, |ext| exclusion_patterns.contains(ext)))
-                {
-                    continue;
+                if let Some(ext) = full_path.extension() {
+                    if exclusion_patterns.contains(ext) {
+                        continue;
+                    }
                 }
+            }
 
-                match entry.file_type() {
-                    Some(nix::dir::Type::Directory) => {
-                        if !no_depth && depth >= max_depth {
-                            continue;
-                        }
-
-                        if visited_dirs.insert(full_path.clone()) {
-                            let mut new_dir_key = dir_key.clone();
-                            new_dir_key.push(file_name_os_str);
-                            subdirs.insert(full_path.clone(), (new_dir_key, depth + 1));
-                        }
+            match entry.file_type() {
+                Some(nix::dir::Type::Directory) => {
+                    if !no_depth && depth >= max_depth {
+                        continue;
                     }
-
-                    Some(nix::dir::Type::File)
-                    | Some(nix::dir::Type::Fifo)
-                    | Some(nix::dir::Type::Symlink)
-                    | Some(nix::dir::Type::CharacterDevice)
-                    | Some(nix::dir::Type::BlockDevice)
-                    | Some(nix::dir::Type::Socket) => {
-                        let meta = match nix::sys::stat::lstat(&full_path) {
-                            Ok(m) => m,
-                            Err(_) => continue,
-                        };
-
-                        let inode = (meta.st_dev, meta.st_ino);
-
-                        if !count_links && meta.st_nlink > 1 {
-                            if !seen_inodes.insert(inode) {
-                                continue;
-                            }
-                        }
-
-                        file_names.push(full_path);
+                    if visited_dirs.insert(full_path.clone()) {
+                        let mut new_dir_key = dir_key.clone();
+                        new_dir_key.push(file_name_os_str);
+                        subdirs.push((full_path, new_dir_key, depth + 1));
                     }
-
-                    _ => {}
+                }
+                Some(_) | None => {
+                    file_names.push(full_path);
                 }
             }
         }
 
-        dir_stack.extend(subdirs.into_iter().rev());
-        dir_map.insert(dir_key, file_names);
-    }
+        let dir_size = if !args.block_size.is_empty() {
+            calculate_directory_sizes(
+                &dir_key,
+                &file_names,
+                args.a,
+                args.summarize,
+                threshold_size,
+                &current_dir,
+                &mut writer,
+                &mut seen_inodes,
+                count_links,
+                &args.block_size,
+            )?
+        } else {
+            calculate_directory_size_default(
+                &dir_key,
+                &file_names,
+                args.human_readable,
+                args.bytes,
+                args.summarize,
+                args.a,
+                threshold_size,
+                count_links,
+                &mut writer,
+                &mut seen_inodes,
+                &current_dir,
+            )
+        };
 
-    Ok(dir_map)
+        total_size += dir_size;
+        dir_stack.extend(subdirs.into_iter().rev());
+    }
+    Ok(total_size)
 }
 
 fn main() -> Result<()> {
-    use std::io::{self, BufWriter, Write};
-
     let g_args = handle_args();
-
-    let (b_tx, b_rx) = mpsc::channel();
-    let (d_tx, d_rx) = mpsc::channel();
-    let b_output = Arc::new(Mutex::new(b_tx));
-    let d_output = Arc::new(Mutex::new(d_tx));
-
     let base_dir = g_args.x.as_ref().unwrap_or(&g_args.path);
     let depth = g_args.depth.unwrap_or(0);
+    let current_dir = env::current_dir()?;
 
-    let dir_map = scan_directory_iter(
+    let dir = if &current_dir == base_dir {
+        format!(".")
+    } else {
+        format!("{}", base_dir.display())
+    };
+
+    let total_size = scan_directory_iter(
         base_dir,
         depth,
         g_args.x.as_deref(),
         g_args.xclude.as_deref(),
         g_args.l,
+        g_args.clone(),
     )?;
 
-    let b_thread = if !g_args.summarize {
-        Some(std::thread::spawn(move || {
-            let mut output = BufWriter::new(io::stdout().lock());
-            for line in b_rx {
-                if writeln!(output, "{}", line).is_err() {
-                    break;
-                }
-            }
-            let _ = output.flush();
-        }))
+    let formatted_size = if g_args.human_readable {
+        get_file_sizes(None, Some(total_size))
+    } else if !g_args.block_size.is_empty() {
+        format_size(total_size, &g_args.block_size)?
     } else {
-        None
-    };
-    let d_thread = if !g_args.summarize {
-        Some(std::thread::spawn(move || {
-            let mut output = BufWriter::new(io::stdout().lock());
-            for line in d_rx {
-                if writeln!(output, "{}", line).is_err() {
-                    break;
-                }
-            }
-            let _ = output.flush();
-        }))
-    } else {
-        None
+        total_size.to_string()
     };
 
-    if !g_args.block_size.is_empty() {
-        let s = format_file_size(
-            &dir_map,
-            &g_args.block_size,
-            g_args.a,
-            g_args.threshold.unwrap_or("0K".to_owned()),
-            b_output.clone(),
-        )
-        .unwrap();
+    if g_args.summarize || depth == 0 {
+        println!("{:<10} {}", formatted_size, dir);
+    }
 
-        if g_args.total {
-            b_output
-                .lock()
-                .unwrap()
-                .send(format!("{:<10}  .", " "))
-                .unwrap();
-        } else if g_args.summarize {
-            println!("{:<10}.", s);
-        }
-    } else {
-        let total_dir_size = calculate_directory_size_default(
-            &dir_map,
-            g_args.human_readable,
-            g_args.bytes,
-            g_args.a,
-            g_args.threshold.unwrap_or_default(),
-            d_output.clone(),
-        );
-        if g_args.summarize || g_args.total || g_args.c {
-            let formatted_size = if g_args.summarize {
-                get_file_sizes(None, Some(total_dir_size))
-            } else {
-                total_dir_size.to_string()
-            };
-            let label = if g_args.summarize { "." } else { "total" };
-            if g_args.total {
-                d_output
-                    .lock()
-                    .unwrap()
-                    .send(format!("{:<10} {label}", total_dir_size))
-                    .unwrap();
-            } else if g_args.summarize && g_args.human_readable {
-                println!("{:<10}{label}", formatted_size)
-            } else {
-                println!("{:<10}{label}", total_dir_size)
-            }
-        }
+    if g_args.c && !g_args.summarize {
+        println!("{:<10} total", formatted_size);
     }
-    drop(b_output);
-    drop(d_output);
-    if let Some(handle) = b_thread {
-        handle.join().unwrap();
-    }
-    if let Some(handle) = d_thread {
-        handle.join().unwrap();
-    }
+
     Ok(())
 }
