@@ -3,11 +3,12 @@
 
 use fxhash::FxHashSet;
 use nix::dir::Dir;
-use nix::fcntl::open;
-use nix::sys::stat;
-use nix::sys::stat::lstat;
+use nix::fcntl::openat;
+use nix::fcntl::{open, AtFlags};
+use nix::sys::stat::{self, fstatat};
 use nix::{fcntl::OFlag, sys::stat::Mode};
 use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io::{BufWriter, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::{
@@ -35,15 +36,12 @@ impl FileStats {
             Err(_) => Self { size: 0, blocks: 0 },
         }
     }
-
     fn size_in_bytes(&self) -> i64 {
         self.size
     }
-
     fn disk_usage_blocks(&self) -> i64 {
         (self.blocks * 512) / 1024
     }
-
     fn disk_usage_bytes(&self) -> i64 {
         self.blocks * 512
     }
@@ -58,6 +56,7 @@ const UNITS: [(&str, f64); 7] = [
     ("E", 1_152_921_504_606_846_976.0),
     ("Z", 1_180_591_620_717_411_303_424.0),
 ];
+
 fn parse_size_to_bytes(size_str: &str) -> Option<i64> {
     let size_str = size_str.trim().to_uppercase();
     let num_end = size_str
@@ -67,7 +66,6 @@ fn parse_size_to_bytes(size_str: &str) -> Option<i64> {
 
     let num_part: f64 = size_str[..num_end].parse().ok()?;
     let unit_part = &size_str[num_end..];
-
     let unit_map: HashMap<&str, f64> = UNITS.iter().cloned().collect();
 
     let multiplier = unit_map.get(unit_part).copied().unwrap_or(1.0);
@@ -99,10 +97,10 @@ fn get_file_sizes(file_path: Option<&Path>, bytes: Option<i64>) -> String {
             break;
         }
     }
-
     write!(output, "{:.1}{}", value, unit).unwrap();
     output
 }
+
 fn format_size(size: i64, arg: &str) -> Cresult<String> {
     let arg_from_2 = &arg[2..];
 
@@ -119,7 +117,9 @@ fn format_size(size: i64, arg: &str) -> Cresult<String> {
         return Err(Error::msg("-B requires a valid argument"));
     }
 }
+
 #[derive(Debug, Clone)]
+#[repr(u8)]
 enum SizeFormat {
     Bytes,
     HumanReadable,
@@ -127,6 +127,7 @@ enum SizeFormat {
 }
 
 impl SizeFormat {
+    #[inline]
     fn get_dir_size(&self, stats: &FileStats) -> i64 {
         match self {
             SizeFormat::Bytes => 0,
@@ -135,6 +136,7 @@ impl SizeFormat {
         }
     }
 
+    #[inline]
     fn get_file_size(&self, stats: &FileStats) -> i64 {
         match self {
             SizeFormat::Bytes => stats.size_in_bytes(),
@@ -256,6 +258,7 @@ fn handle_args() -> Args {
         l,
     }
 }
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 enum FileContent {
     Path(PathBuf),
@@ -320,7 +323,6 @@ fn process_directories(
     use std::ffi::OsStr;
     use std::io::{stdout, BufWriter, Write};
 
-    let current_dir = env::current_dir().context("Failed to get current directory")?;
     let mut writer = BufWriter::new(stdout());
     let mut seen_inodes = FxHashSet::default();
 
@@ -351,31 +353,80 @@ fn process_directories(
         }
     }
 
-    let total = recursive_dir_iter(
+    let fd = match open(
         root_dir,
-        0,
-        max_depth,
-        root_dev,
-        &exclusion_paths,
-        &exclusion_patterns,
-        args.human_readable,
-        args.bytes,
-        args.summarize,
-        args.a,
-        threshold,
-        count_links,
-        &mut writer,
-        &mut seen_inodes,
-        &current_dir,
-        &args.block_size,
-    )?;
+        OFlag::O_DIRECTORY | OFlag::O_RDONLY,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(_) => return Ok(0),
+    };
+
+    let threshold_bytes = parse_size_to_bytes(threshold).unwrap_or(0);
+    let threshold = if !args.bytes && !args.human_readable {
+        threshold_bytes / 1024
+    } else {
+        threshold_bytes
+    };
+
+    let size_format = if !args.block_size.is_empty() {
+        SizeFormat::HumanReadable
+    } else if args.bytes {
+        SizeFormat::Bytes
+    } else if args.human_readable {
+        SizeFormat::HumanReadable
+    } else {
+        SizeFormat::Blocks
+    };
+    let total = if !args.block_size.is_empty() {
+        recursive_dir_iter(
+            fd,
+            0,
+            max_depth,
+            root_dev,
+            &exclusion_paths,
+            &exclusion_patterns,
+            args.human_readable,
+            args.bytes,
+            args.summarize,
+            args.a,
+            threshold_bytes,
+            count_links,
+            &mut writer,
+            &mut seen_inodes,
+            Some(&args.block_size),
+            is_exclude,
+            &size_format,
+        )?
+    } else {
+        recursive_dir_iter(
+            fd,
+            0,
+            max_depth,
+            root_dev,
+            &exclusion_paths,
+            &exclusion_patterns,
+            args.human_readable,
+            args.bytes,
+            args.summarize,
+            args.a,
+            threshold_bytes,
+            count_links,
+            &mut writer,
+            &mut seen_inodes,
+            None,
+            is_exclude,
+            &size_format,
+        )?
+    };
 
     writer.flush()?;
     Ok(total)
 }
 
+#[inline(always)]
 fn recursive_dir_iter(
-    path: &Path,
+    raw_fd: RawFd,
     current_depth: i32,
     max_depth: i32,
     root_dev: Option<u64>,
@@ -385,59 +436,42 @@ fn recursive_dir_iter(
     is_bytes: bool,
     summarize: bool,
     list_files: bool,
-    threshold_size: &str,
+    threshold_size: i64,
     count_links: bool,
     writer: &mut BufWriter<std::io::Stdout>,
     seen_inodes: &mut FxHashSet<(u64, u64)>,
-    current_dir: &Path,
-    block_size: &str,
+    block_size: Option<&str>,
+    exclude_path: Option<&Path>,
+    size_format: &SizeFormat,
 ) -> Result<i64> {
-    let use_block_size = !block_size.is_empty();
-    let size_format = if use_block_size {
-        SizeFormat::HumanReadable
-    } else if is_bytes {
-        SizeFormat::Bytes
-    } else if format {
-        SizeFormat::HumanReadable
-    } else {
-        SizeFormat::Blocks
-    };
-
-    let threshold_bytes = parse_size_to_bytes(threshold_size).unwrap_or(0);
-    let threshold = if !is_bytes && !format {
-        threshold_bytes / 1024
-    } else {
-        threshold_bytes
-    };
+    let mut path_stack = vec![OsString::from(".")];
 
     let mut total_size: i64 = 0;
-
-    if let Ok(meta) = lstat(path) {
-        let dir_stats = FileStats {
-            size: meta.st_size,
-            blocks: meta.st_blocks,
+    let meta =
+        if let Ok(meta) = fstatat(Some(raw_fd), OsStr::new("."), AtFlags::AT_SYMLINK_NOFOLLOW) {
+            meta
+        } else {
+            return Ok(0);
         };
-        total_size += size_format.get_dir_size(&dir_stats);
-
-        if let Some(dev) = root_dev {
-            if meta.st_dev != dev {
-                return Ok(0);
-            }
+    if let Some(dev) = root_dev {
+        if meta.st_dev != dev {
+            return Ok(0);
         }
     }
 
-    let fd = match open(path, OFlag::O_DIRECTORY | OFlag::O_RDONLY, Mode::empty()) {
-        Ok(fd) => fd,
-        Err(_) => return Ok(total_size),
+    let file_stats = FileStats {
+        size: meta.st_size,
+        blocks: meta.st_blocks,
     };
+    total_size += size_format.get_dir_size(&file_stats);
 
-    let dir = match Dir::from_fd(fd) {
+    let dir = match Dir::from_fd(raw_fd) {
         Ok(d) => d,
         Err(_) => return Ok(total_size),
     };
 
-    for entry_res in dir {
-        let entry = match entry_res {
+    for entry in dir {
+        let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
         };
@@ -446,14 +480,16 @@ fn recursive_dir_iter(
         if name_bytes == b"." || name_bytes == b".." {
             continue;
         }
-        let file_name_os_str = OsStr::from_bytes(entry.file_name().to_bytes());
-        let child_path = path.join(file_name_os_str);
 
-        if exclusion_paths.contains(&child_path) {
-            continue;
-        }
-        if let Some(ext) = child_path.extension() {
-            if exclusion_patterns.contains(ext) {
+        let name_osstr = OsStr::from_bytes(name_bytes);
+        let child_meta = match fstatat(Some(raw_fd), name_osstr, AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        if !count_links && child_meta.st_nlink > 1 {
+            let inode = (child_meta.st_dev as u64, child_meta.st_ino as u64);
+            if !seen_inodes.insert(inode) {
                 continue;
             }
         }
@@ -464,8 +500,19 @@ fn recursive_dir_iter(
                     continue;
                 }
 
+                let sub_fd = match openat(
+                    Some(raw_fd),
+                    name_osstr,
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW,
+                    Mode::empty(),
+                ) {
+                    Ok(fd) => fd,
+                    Err(_) => continue,
+                };
+
+                path_stack.push(name_osstr.to_os_string());
                 let subdir_size = recursive_dir_iter(
-                    &child_path,
+                    sub_fd,
                     current_depth + 1,
                     max_depth,
                     root_dev,
@@ -479,93 +526,74 @@ fn recursive_dir_iter(
                     count_links,
                     writer,
                     seen_inodes,
-                    current_dir,
                     block_size,
+                    exclude_path,
+                    size_format,
                 )?;
+
                 total_size += subdir_size;
+
+                path_stack.pop();
             }
+
             _ => {
-                let meta = match lstat(&child_path) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-
-                if !count_links && meta.st_nlink > 1 {
-                    let inode = (meta.st_dev as u64, meta.st_ino as u64);
-                    if !seen_inodes.insert(inode) {
-                        continue;
-                    }
-                }
-
                 let file_stats = FileStats {
-                    size: meta.st_size,
-                    blocks: meta.st_blocks,
+                    size: child_meta.st_size,
+                    blocks: child_meta.st_blocks,
                 };
+
                 let file_size = size_format.get_file_size(&file_stats);
                 total_size += file_size;
 
-                if list_files && !summarize && file_size >= threshold {
-                    let relative_display = match child_path.strip_prefix(current_dir) {
-                        Ok(rel) => rel.to_string_lossy(),
-                        Err(_) => child_path.to_string_lossy(),
-                    };
-
-                    if use_block_size {
-                        let formatted_size = format_size(file_size, block_size)?;
-                        if child_path.starts_with(current_dir) {
-                            writeln!(writer, "{:<10} ./{}", formatted_size, relative_display)?;
-                        } else {
-                            writeln!(writer, "{:<10} {}", formatted_size, relative_display)?;
-                        }
+                if list_files && !summarize && file_size >= threshold_size {
+                    let rel = build_relative_path(&path_stack, name_osstr);
+                    if block_size.is_some() {
+                        let formatted = format_size(file_size, block_size.unwrap())?;
+                        writeln!(writer, "{:<10} {}", formatted, rel)?;
                     } else if format {
-                        let formatted_size = get_file_sizes(None, Some(file_size));
-                        if child_path.starts_with(current_dir) {
-                            writeln!(writer, "{:<10} ./{}", formatted_size, relative_display)?;
-                        } else {
-                            writeln!(writer, "{:<10} {}", formatted_size, relative_display)?;
-                        }
+                        let formatted = get_file_sizes(None, Some(file_size));
+                        writeln!(writer, "{:<10} {}", formatted, rel)?;
                     } else {
-                        if child_path.starts_with(current_dir) {
-                            writeln!(writer, "{:<10} ./{}", file_size, relative_display)?;
-                        } else {
-                            writeln!(writer, "{:<10} {}", file_size, relative_display)?;
-                        }
+                        writeln!(writer, "{:<10} {}", file_size, rel)?;
                     }
                 }
             }
         }
     }
 
-    if !summarize && total_size >= threshold {
-        let relative_display = match path.strip_prefix(current_dir) {
-            Ok(rel) => rel.to_string_lossy(),
-            Err(_) => path.to_string_lossy(),
-        };
+    if !summarize && total_size >= threshold_size {
+        let rel = build_relative_path(&path_stack, OsStr::new("."));
 
-        if use_block_size {
-            let formatted_size = format_size(total_size, block_size)?;
-            if path.starts_with(current_dir) {
-                writeln!(writer, "{:<10} ./{}", formatted_size, relative_display)?;
-            } else {
-                writeln!(writer, "{:<10} {}", formatted_size, relative_display)?;
-            }
+        if block_size.is_some() {
+            let formatted = format_size(total_size, block_size.unwrap())?;
+            writeln!(writer, "{:<10} {}", formatted, rel)?;
         } else if format {
-            let formatted_size = get_file_sizes(None, Some(total_size));
-            if path.starts_with(current_dir) {
-                writeln!(writer, "{:<10} ./{}", formatted_size, relative_display)?;
-            } else {
-                writeln!(writer, "{:<10} {}", formatted_size, relative_display)?;
-            }
+            let formatted = get_file_sizes(None, Some(total_size));
+            writeln!(writer, "{:<10} {}", formatted, rel)?;
         } else {
-            if path.starts_with(current_dir) {
-                writeln!(writer, "{:<10} ./{}", total_size, relative_display)?;
-            } else {
-                writeln!(writer, "{:<10} {}", total_size, relative_display)?;
-            }
+            writeln!(writer, "{:<10} {}", total_size, rel)?;
         }
     }
 
     Ok(total_size)
+}
+
+fn build_relative_path(stack: &[OsString], name: &OsStr) -> String {
+    if name == OsStr::new(".") && stack.len() == 1 && stack[0] == OsStr::new(".") {
+        return ".".to_string();
+    }
+
+    let mut out = String::new();
+    for part in stack {
+        out.push_str(&part.to_string_lossy());
+        out.push('/');
+    }
+    if name != OsStr::new(".") {
+        out.push_str(&name.to_string_lossy());
+    } else if stack.len() == 1 && stack[0] != OsStr::new(".") {
+        out.push_str(".");
+    }
+    out
 }
 
 fn main() -> Result<()> {
