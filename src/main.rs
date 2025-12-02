@@ -1,6 +1,3 @@
-#![allow(unused_variables)]
-#![allow(dead_code)]
-
 use fxhash::FxHashSet;
 use nix::dir::Dir;
 use nix::fcntl::openat;
@@ -26,15 +23,6 @@ struct FileStats {
 }
 
 impl FileStats {
-    fn from(path: &Path) -> Self {
-        match stat::stat(path) {
-            Ok(res) => Self {
-                size: res.st_size,
-                blocks: res.st_blocks,
-            },
-            Err(_) => Self { size: 0, blocks: 0 },
-        }
-    }
     fn size_in_bytes(&self) -> i64 {
         self.size
     }
@@ -177,7 +165,8 @@ struct Args {
     x: Option<PathBuf>,
     xclude: Option<PathBuf>,
     a: bool,
-    l: bool,
+    count_hardlinks: bool,
+    follow_symlinks: bool,
     c: bool,
 }
 
@@ -194,14 +183,16 @@ fn handle_args() -> Args {
     let mut x = None;
     let mut xclude = None;
     let mut a = false;
-    let mut l = false;
+    let mut follow_symlinks = false;
     let mut c = false;
+    let mut count_hardlinks = false;
     while let Some(arg) = arguments.next() {
         match arg.as_str() {
             "--help" => print_help(),
             "-h" | "--human-readable" => human_readable = true,
             "-a" | "--all" => a = true,
-            "-l" => l = true,
+            "-L" => follow_symlinks = true,
+            "-l" => count_hardlinks = true,
             "-c" | "--total" => {
                 total = true;
                 c = true;
@@ -254,7 +245,8 @@ fn handle_args() -> Args {
         x,
         c,
         a,
-        l,
+        count_hardlinks,
+        follow_symlinks,
     }
 }
 
@@ -309,22 +301,20 @@ fn exclude_list(file: &Path) -> HashSet<FileContent> {
     hs
 }
 
-fn process_directories(
-    root_dir: &Path,
-    max_depth: i32,
-    x_option: Option<&Path>,
-    is_exclude: Option<&Path>,
-    count_links: bool,
-    args: Args,
-) -> Result<i64> {
+fn process_directories(args: Args) -> Result<i64> {
     use fxhash::FxHashSet;
     use nix::sys::stat::stat;
     use std::ffi::OsStr;
     use std::io::{stdout, BufWriter, Write};
 
+    let root_dir: &PathBuf = &args.path;
+    let max_depth = args.depth.unwrap_or(0);
+    let x_option = args.x;
+    let xclude = args.xclude.as_deref();
+    let count_hardlinks = args.count_hardlinks;
     let mut writer = BufWriter::new(stdout());
     let mut seen_inodes = FxHashSet::default();
-
+    let follow_symlink = args.follow_symlinks;
     let threshold = args.threshold.as_deref().unwrap_or("0");
 
     let root_dev = if x_option.is_some() {
@@ -339,8 +329,8 @@ fn process_directories(
 
     let mut exclusion_paths = FxHashSet::default();
     let mut exclusion_patterns = FxHashSet::default();
-    if let Some(exclude_path) = is_exclude {
-        for s in crate::exclude_list(exclude_path) {
+    if let Some(exclude_path) = xclude {
+        for s in exclude_list(exclude_path) {
             match s {
                 FileContent::Path(p) => {
                     exclusion_paths.insert(p);
@@ -352,13 +342,24 @@ fn process_directories(
         }
     }
 
-    let fd = match open(
-        root_dir,
-        OFlag::O_DIRECTORY | OFlag::O_RDONLY | OFlag::O_NOFOLLOW,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(_) => return Ok(0),
+    let fd = if !count_hardlinks {
+        match open(
+            root_dir,
+            OFlag::O_DIRECTORY | OFlag::O_RDONLY | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(_) => return Ok(0),
+        }
+    } else {
+        match open(
+            root_dir,
+            OFlag::O_DIRECTORY | OFlag::O_RDONLY,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(_) => return Ok(0),
+        }
     };
 
     let threshold_bytes = parse_size_to_bytes(threshold).unwrap_or(0);
@@ -378,7 +379,7 @@ fn process_directories(
         SizeFormat::Blocks
     };
     let current_dir = env::current_dir()?;
-    let is_current_dir = root_dir == current_dir || root_dir.as_os_str() == OsStr::new(".");
+    let is_current_dir = root_dir == &current_dir || root_dir.as_os_str() == OsStr::new(".");
 
     let mut path_bytes = Vec::with_capacity(4096);
 
@@ -388,8 +389,6 @@ fn process_directories(
         let root_bytes = root_dir.as_os_str().as_bytes();
         path_bytes.extend_from_slice(root_bytes);
     }
-
-    let base_len = path_bytes.len();
 
     let total = if !args.block_size.is_empty() {
         recursive_dir_iter(
@@ -403,12 +402,13 @@ fn process_directories(
             args.bytes,
             args.summarize,
             args.a,
-            threshold_bytes,
-            count_links,
+            threshold,
+            follow_symlink,
+            count_hardlinks,
             &mut writer,
             &mut seen_inodes,
             Some(&args.block_size),
-            is_exclude,
+            xclude,
             &size_format,
             &mut path_bytes,
         )?
@@ -424,12 +424,13 @@ fn process_directories(
             args.bytes,
             args.summarize,
             args.a,
-            threshold_bytes,
-            count_links,
+            threshold,
+            follow_symlink,
+            count_hardlinks,
             &mut writer,
             &mut seen_inodes,
             None,
-            is_exclude,
+            xclude,
             &size_format,
             &mut path_bytes,
         )?
@@ -452,7 +453,8 @@ fn recursive_dir_iter(
     summarize: bool,
     list_files: bool,
     threshold_size: i64,
-    count_links: bool,
+    follow_sysmlink: bool,
+    count_hard_link: bool,
     writer: &mut BufWriter<std::io::Stdout>,
     seen_inodes: &mut FxHashSet<(u64, u64)>,
     block_size: Option<&str>,
@@ -463,13 +465,21 @@ fn recursive_dir_iter(
     use std::os::unix::ffi::OsStrExt;
 
     let mut total_size: i64 = 0;
+    let use_exclusion = exclude_path.is_some();
 
-    let meta =
+    let meta = if !follow_sysmlink {
         if let Ok(meta) = fstatat(Some(raw_fd), OsStr::new("."), AtFlags::AT_SYMLINK_NOFOLLOW) {
             meta
         } else {
             return Ok(0);
-        };
+        }
+    } else {
+        if let Ok(meta) = fstatat(Some(raw_fd), OsStr::new("."), AtFlags::empty()) {
+            meta
+        } else {
+            return Ok(0);
+        }
+    };
 
     if let Some(dev) = root_dev {
         if meta.st_dev != dev {
@@ -500,13 +510,28 @@ fn recursive_dir_iter(
         }
 
         let file_name_osstr = OsStr::from_bytes(file_name_bytes);
-        let child_meta = match fstatat(Some(raw_fd), file_name_osstr, AtFlags::AT_SYMLINK_NOFOLLOW)
-        {
-            Ok(m) => m,
-            Err(_) => continue,
+        let child_meta = if !follow_sysmlink {
+            match fstatat(Some(raw_fd), file_name_osstr, AtFlags::AT_SYMLINK_NOFOLLOW) {
+                Ok(m) => m,
+                Err(_) => continue,
+            }
+        } else {
+            match fstatat(Some(raw_fd), file_name_osstr, AtFlags::empty()) {
+                Ok(m) => m,
+                Err(_) => continue,
+            }
         };
 
-        if !count_links && child_meta.st_nlink > 1 {
+        if use_exclusion
+            && (exclusion_paths.contains(&PathBuf::from(file_name_osstr.to_owned()))
+                || PathBuf::from(file_name_osstr.to_owned())
+                    .extension()
+                    .map_or(false, |ext| exclusion_patterns.contains(ext)))
+        {
+            continue;
+        }
+
+        if !count_hard_link && child_meta.st_nlink > 1 {
             let inode = (child_meta.st_dev as u64, child_meta.st_ino as u64);
             if !seen_inodes.insert(inode) {
                 continue;
@@ -519,14 +544,26 @@ fn recursive_dir_iter(
                     continue;
                 }
 
-                let sub_fd = match openat(
-                    Some(raw_fd),
-                    file_name_osstr,
-                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW,
-                    Mode::empty(),
-                ) {
-                    Ok(fd) => fd,
-                    Err(_) => continue,
+                let sub_fd = if !follow_sysmlink {
+                    match openat(
+                        Some(raw_fd),
+                        file_name_osstr,
+                        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW,
+                        Mode::empty(),
+                    ) {
+                        Ok(fd) => fd,
+                        Err(_) => continue,
+                    }
+                } else {
+                    match openat(
+                        Some(raw_fd),
+                        file_name_osstr,
+                        OFlag::O_RDONLY | OFlag::O_DIRECTORY,
+                        Mode::empty(),
+                    ) {
+                        Ok(fd) => fd,
+                        Err(_) => continue,
+                    }
                 };
 
                 let saved_len = path_bytes.len();
@@ -548,7 +585,8 @@ fn recursive_dir_iter(
                     summarize,
                     list_files,
                     threshold_size,
-                    count_links,
+                    follow_sysmlink,
+                    count_hard_link,
                     writer,
                     seen_inodes,
                     block_size,
@@ -618,7 +656,6 @@ fn recursive_dir_iter(
 fn main() -> Result<()> {
     let g_args = handle_args();
     let base_dir = g_args.x.as_ref().unwrap_or(&g_args.path);
-    let depth = g_args.depth.unwrap_or(0);
     let current_dir = env::current_dir()?;
 
     let dir = if &current_dir == base_dir {
@@ -627,14 +664,7 @@ fn main() -> Result<()> {
         format!("{}", base_dir.display())
     };
 
-    let total_size = process_directories(
-        base_dir,
-        depth,
-        g_args.x.as_deref(),
-        g_args.xclude.as_deref(),
-        g_args.l,
-        g_args.clone(),
-    )?;
+    let total_size = process_directories(g_args.clone())?;
     let formatted_size = if g_args.human_readable {
         get_file_sizes(None, Some(total_size))
     } else if !g_args.block_size.is_empty() {
@@ -644,7 +674,7 @@ fn main() -> Result<()> {
     };
     if g_args.summarize {
         println!("{:<10} {}", formatted_size, dir);
-    } else if g_args.c && !g_args.summarize {
+    } else if g_args.c && !g_args.summarize || g_args.total {
         println!("{:<10} total", formatted_size);
     } else {
         println!("{:<10} {}", formatted_size, dir);
