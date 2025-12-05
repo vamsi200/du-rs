@@ -16,7 +16,7 @@ use std::{
 };
 
 type Cresult<T> = anyhow::Result<T, anyhow::Error>;
-use anyhow::{Context, Error, Result};
+use anyhow::{Context, Error};
 struct FileStats {
     size: i64,
     blocks: i64,
@@ -73,8 +73,7 @@ fn get_file_sizes(file_path: Option<&Path>, bytes: Option<i64>) -> String {
     let mut output = String::with_capacity(32);
 
     if bytes < 1024 {
-        write!(output, "{}B", bytes).unwrap();
-        return output;
+        return format!("{bytes}B");
     }
 
     let mut value = bytes as f64;
@@ -87,7 +86,7 @@ fn get_file_sizes(file_path: Option<&Path>, bytes: Option<i64>) -> String {
             break;
         }
     }
-    write!(output, "{:.1}{}", value, unit).unwrap();
+    let _ = write!(output, "{:.1}{}", value, unit);
     output
 }
 
@@ -172,7 +171,14 @@ struct Args {
 
 fn handle_args() -> Args {
     let mut arguments = env::args().skip(1);
-    let mut path = env::current_dir().unwrap();
+    let mut path = match env::current_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("du-rs: cannot determine current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let mut human_readable = false;
     let mut depth = None;
     let mut summarize = false;
@@ -257,21 +263,43 @@ enum FileContent {
 }
 
 fn exclude_list(file: &Path) -> HashSet<FileContent> {
-    let file_fd: RawFd = nix::fcntl::open(file, OFlag::O_RDONLY, Mode::empty()).unwrap();
+    let file_fd = match nix::fcntl::open(file, OFlag::O_RDONLY, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(e) => {
+            eprintln!("du-rs: cannot access '{}': {}", file.display(), e);
+            return HashSet::new();
+        }
+    };
+
     let mut buffer = [0u8; 1024];
     let mut content = String::new();
     let mut hs = HashSet::new();
 
     loop {
-        let bytes_read = nix::unistd::read(file_fd, &mut buffer).unwrap();
+        let bytes_read = match nix::unistd::read(file_fd, &mut buffer) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("du-rs: failed reading '{}': {}", file.display(), e);
+                return HashSet::new();
+            }
+        };
+
         if bytes_read == 0 {
             break;
         }
         content.push_str(&String::from_utf8_lossy(&buffer[..bytes_read]));
     }
-    nix::unistd::close(file_fd).unwrap();
+    if let Err(e) = nix::unistd::close(file_fd) {
+        eprintln!("du-rs: failed to close file {}: {}", file_fd, e);
+    }
 
-    let current_dir = env::current_dir().unwrap();
+    let current_dir = match env::current_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("du-rs: cannot determine current directory: {e}");
+            std::process::exit(1);
+        }
+    };
 
     for line in content.lines() {
         let trimmed_line = line.trim();
@@ -317,7 +345,7 @@ struct TraversalConfig {
     at_flag: AtFlags,
 }
 
-fn process_directories(args: Args) -> Result<i64> {
+fn process_directories(args: Args) -> Cresult<i64> {
     use fxhash::FxHashSet;
     use nix::fcntl::open;
     use nix::sys::stat::{stat, Mode};
@@ -450,7 +478,7 @@ fn recursive_dir_iter(
     writer: &mut BufWriter<std::io::Stdout>,
     seen_inodes: &mut FxHashSet<(u64, u64)>,
     path_bytes: &mut Vec<u8>,
-) -> Result<i64> {
+) -> Cresult<i64> {
     let mut total_size: i64 = 0;
 
     let meta = {
@@ -490,21 +518,20 @@ fn recursive_dir_iter(
         }
 
         let file_name_osstr = OsStr::from_bytes(file_name_bytes);
-
-        if config.exclusion_paths.is_some() || config.exclusion_patterns.is_some() {
-            if config
-                .exclusion_paths
-                .as_ref()
-                .unwrap()
-                .contains(&PathBuf::from(file_name_osstr.to_owned()))
-                || PathBuf::from(file_name_osstr.to_owned())
+        let excluded = config.exclusion_paths.as_ref().map_or(false, |paths| {
+            let file_path = Path::new(file_name_osstr);
+            paths.contains(file_path)
+        }) || config
+            .exclusion_patterns
+            .as_ref()
+            .map_or(false, |patterns| {
+                Path::new(file_name_osstr)
                     .extension()
-                    .map_or(false, |ext| {
-                        config.exclusion_patterns.as_ref().unwrap().contains(ext)
-                    })
-            {
-                continue;
-            }
+                    .map_or(false, |ext| patterns.contains(ext))
+            });
+
+        if excluded {
+            continue;
         }
 
         match entry.file_type() {
@@ -609,9 +636,9 @@ fn write_to_stdout(
     path_bytes: &[u8],
     block_size: Option<&str>,
     format: bool,
-) -> std::io::Result<()> {
+) -> Cresult<()> {
     let size_str = if let Some(bs) = block_size {
-        format_size(size, bs).unwrap()
+        format_size(size, bs)?
     } else if format {
         get_file_sizes(None, Some(size))
     } else {
@@ -636,7 +663,7 @@ fn write_to_stdout(
     Ok(())
 }
 
-fn main() -> Result<()> {
+fn main() -> Cresult<()> {
     let g_args = handle_args();
     let base_dir = g_args.x.as_ref().unwrap_or(&g_args.path);
     let current_dir = env::current_dir()?;

@@ -5,9 +5,14 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.97"
-dashmap = "6.1.0"
 fxhash = "0.2.1"
-indexmap = { version = "2.8", features = ["rayon"] }
+itoa = "1.0.15"
 nix = {version = "0.29.0", features = ["dir", "fs"]}
-rayon = "1.10.0"
+
+[profile.release]
+strip = false
+codegen-units = 1
+lto = "fat"
+opt-level = "s"
+panic = "abort"
 
