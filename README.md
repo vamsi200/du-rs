@@ -4,8 +4,6 @@
 
 `du-rs` is a Rust reimplementation of the classic Unix `du` (disk usage) command. This project is both an exploration of Rust's systems programming capabilities and a functional alternative to the traditional `du` utility.
 
-> **Note:** This project is under active development. Performance isn’t great yet, and the code could `definitely` be better.
-
 ## Overview
 
 The `du` command estimates file space usage. This Rust implementation maintains compatibility with many of the original `du` command's options while leveraging Rust's memory safety and performance benefits.
