@@ -1,10 +1,12 @@
 use fxhash::FxHashSet;
 use nix::dir::Dir;
+use nix::fcntl::open;
 use nix::fcntl::openat;
 use nix::fcntl::AtFlags;
 use nix::sys::stat::{self, fstatat};
 use nix::{fcntl::OFlag, sys::stat::Mode};
 use std::ffi::{OsStr, OsString};
+use std::io::stdout;
 use std::io::{BufWriter, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::{
@@ -153,7 +155,7 @@ Options:
 
 #[derive(Debug, Clone)]
 struct Args {
-    path: PathBuf,
+    path: Vec<PathBuf>,
     human_readable: bool,
     depth: Option<i32>,
     summarize: bool,
@@ -171,14 +173,7 @@ struct Args {
 
 fn handle_args() -> Args {
     let mut arguments = env::args().skip(1);
-    let mut path = match env::current_dir() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("du-rs: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-
+    let mut path_vec = Vec::new();
     let mut human_readable = false;
     let mut depth = None;
     let mut summarize = false;
@@ -192,55 +187,73 @@ fn handle_args() -> Args {
     let mut follow_symlinks = false;
     let mut c = false;
     let mut count_hardlinks = false;
+    let mut stop_parsing_flags = false;
+
     while let Some(arg) = arguments.next() {
-        match arg.as_str() {
-            "--help" => print_help(),
-            "-h" | "--human-readable" => human_readable = true,
-            "-a" | "--all" => a = true,
-            "-L" => follow_symlinks = true,
-            "-l" => count_hardlinks = true,
-            "-c" | "--total" => {
-                total = true;
-                c = true;
-            }
-            "-ah" => {
-                a = true;
-                human_readable = true;
-            }
-            "-sh" => {
-                summarize = true;
-                human_readable = true;
-            }
-            "-b" => bytes = true,
-            "-s" | "--summarize" => summarize = true,
-            "-d" | "--max-depth" => {
-                depth = arguments.next().and_then(|v| v.parse().ok());
-            }
-            _ if arg.starts_with("-B") => {
-                block_size = arg;
-            }
-            "-t" | "--threshold" => {
-                threshold = arguments.next().and_then(|v| v.parse().ok());
-            }
-            "-x" | "--one-file-system" => {
-                x = arguments.next().map(PathBuf::from);
-            }
-            "-X" | "--exclude-from" => {
-                xclude = arguments.next().map(PathBuf::from);
-            }
-            _ => {
-                if arg.starts_with('-') {
+        if arg == "--" {
+            stop_parsing_flags = true;
+            continue;
+        }
+
+        if !stop_parsing_flags {
+            match arg.as_str() {
+                "--help" => print_help(),
+                "-h" | "--human-readable" => human_readable = true,
+                "-a" | "--all" => a = true,
+                "-L" => follow_symlinks = true,
+                "-l" => count_hardlinks = true,
+                "-c" | "--total" => {
+                    total = true;
+                    c = true;
+                }
+                "-ah" => {
+                    a = true;
+                    human_readable = true;
+                }
+                "-sh" => {
+                    summarize = true;
+                    human_readable = true;
+                }
+                "-b" => bytes = true,
+                "-s" | "--summarize" => summarize = true,
+                "-d" | "--max-depth" => {
+                    depth = arguments.next().and_then(|v| v.parse().ok());
+                }
+                _ if arg.starts_with("-B") => {
+                    block_size = arg.clone();
+                }
+                "-t" | "--threshold" => {
+                    threshold = arguments.next().and_then(|v| v.parse().ok());
+                }
+                "-x" | "--one-file-system" => {
+                    x = arguments.next().map(PathBuf::from);
+                }
+                "-X" | "--exclude-from" => {
+                    xclude = arguments.next().map(PathBuf::from);
+                }
+                _ if arg.starts_with('-') => {
                     eprintln!("Error: Invalid argument '{}'", arg);
                     exit(1);
                 }
-                path = PathBuf::from(arg);
+                _ => {}
             }
+        } else {
+            path_vec.push(PathBuf::from(arg));
+            continue;
         }
+
+        if stop_parsing_flags || !arg.starts_with('-') {
+            path_vec.push(PathBuf::from(arg));
+        }
+    }
+
+    if path_vec.is_empty() {
+        path_vec.push(PathBuf::from("."));
     }
 
     Args {
         depth,
-        path,
+        path: path_vec,
         human_readable,
         bytes,
         summarize,
@@ -345,7 +358,12 @@ struct TraversalConfig {
     at_flag: AtFlags,
 }
 
-fn process_directories(args: Args) -> Cresult<i64> {
+fn process_directories(
+    args: &Args,
+    root_dir: &PathBuf,
+    open_flag: OFlag,
+    at_flag: AtFlags,
+) -> Cresult<i64> {
     use fxhash::FxHashSet;
     use nix::fcntl::open;
     use nix::sys::stat::{stat, Mode};
@@ -353,22 +371,7 @@ fn process_directories(args: Args) -> Cresult<i64> {
     use std::ffi::{OsStr, OsString};
     use std::io::{stdout, BufWriter, Write};
 
-    let root_dir: &PathBuf = &args.path;
     let max_depth = args.depth.unwrap_or(0);
-
-    let follow_symlink = args.follow_symlinks;
-
-    let open_flag = if !follow_symlink {
-        OFlag::O_DIRECTORY | OFlag::O_RDONLY | OFlag::O_NOFOLLOW
-    } else {
-        OFlag::O_DIRECTORY | OFlag::O_RDONLY
-    };
-
-    let at_flag = if !follow_symlink {
-        AtFlags::AT_SYMLINK_NOFOLLOW
-    } else {
-        AtFlags::empty()
-    };
 
     let fd = match open(root_dir, open_flag, Mode::empty()) {
         Ok(fd) => fd,
@@ -444,7 +447,7 @@ fn process_directories(args: Args) -> Cresult<i64> {
     };
 
     let mut writer = BufWriter::new(stdout());
-    let mut seen_inodes = FxHashSet::default();
+    let mut seen_inodes = FxHashSet::with_capacity_and_hasher(1024, Default::default());
     let mut path_bytes = Vec::with_capacity(4096);
 
     let current_dir = env::current_dir()?;
@@ -469,6 +472,48 @@ fn process_directories(args: Args) -> Cresult<i64> {
     writer.flush()?;
 
     Ok(total)
+}
+
+fn get_file_info(raw_fd: RawFd, args: &Args, file_path: OsString, at_flag: AtFlags) -> Cresult<()> {
+    let size_format = if !args.block_size.is_empty() {
+        SizeFormat::HumanReadable
+    } else if args.bytes {
+        SizeFormat::Bytes
+    } else if args.human_readable {
+        SizeFormat::HumanReadable
+    } else {
+        SizeFormat::Blocks
+    };
+
+    let mut buf_writer = BufWriter::new(stdout());
+
+    let block_size = if args.block_size.is_empty() {
+        None
+    } else {
+        Some(args.block_size.clone())
+    };
+
+    let meta = {
+        if let Ok(meta) = fstatat(Some(raw_fd), file_path.as_os_str(), at_flag) {
+            meta
+        } else {
+            return Ok(());
+        }
+    };
+
+    let file_stats = FileStats {
+        size: meta.st_size,
+        blocks: meta.st_blocks,
+    };
+    let file_size = size_format.get_file_size(&file_stats);
+    write_to_stdout(
+        &mut buf_writer,
+        file_size,
+        file_path.as_bytes(),
+        block_size.as_deref(),
+        args.human_readable,
+    )?;
+    Ok(())
 }
 
 fn recursive_dir_iter(
@@ -665,30 +710,64 @@ fn write_to_stdout(
 
 fn main() -> Cresult<()> {
     let g_args = handle_args();
-    let base_dir = g_args.x.as_ref().unwrap_or(&g_args.path);
     let current_dir = env::current_dir()?;
+    let follow_symlink = g_args.follow_symlinks;
 
-    let dir = if &current_dir == base_dir {
-        format!(".")
+    let at_flag = if !follow_symlink {
+        AtFlags::AT_SYMLINK_NOFOLLOW
     } else {
-        format!("{}", base_dir.display())
+        AtFlags::empty()
     };
 
-    let total_size = process_directories(g_args.clone())?;
-    let formatted_size = if g_args.human_readable {
-        get_file_sizes(None, Some(total_size))
-    } else if !g_args.block_size.is_empty() {
-        format_size(total_size, &g_args.block_size)?
+    let open_flag = if !follow_symlink {
+        OFlag::O_DIRECTORY | OFlag::O_RDONLY | OFlag::O_NOFOLLOW
     } else {
-        total_size.to_string()
+        OFlag::O_DIRECTORY | OFlag::O_RDONLY
     };
-    if g_args.summarize {
-        println!("{:<10} {}", formatted_size, dir);
-    } else if g_args.c && !g_args.summarize || g_args.total {
-        println!("{:<10} total", formatted_size);
-    } else {
-        println!("{:<10} {}", formatted_size, dir);
+
+    for path in &g_args.path {
+        let fd = match open(&current_dir, open_flag, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(_) => continue,
+        };
+
+        match fstatat(Some(fd), path.as_os_str(), at_flag) {
+            Ok(meta)
+                if (meta.st_mode & nix::sys::stat::SFlag::S_IFMT.bits())
+                    == nix::sys::stat::SFlag::S_IFREG.bits() =>
+            {
+                get_file_info(fd, &g_args, path.as_os_str().to_os_string(), at_flag)?;
+            }
+            Ok(meta)
+                if (meta.st_mode & nix::sys::stat::SFlag::S_IFMT.bits())
+                    == nix::sys::stat::SFlag::S_IFDIR.bits() =>
+            {
+                let base_dir = g_args.x.as_ref().unwrap_or(path);
+
+                let dir = if &current_dir == base_dir {
+                    format!(".")
+                } else {
+                    format!("{}", base_dir.display())
+                };
+
+                let total_size = process_directories(&g_args, path, open_flag, at_flag)?;
+                let formatted_size = if g_args.human_readable {
+                    get_file_sizes(None, Some(total_size))
+                } else if !g_args.block_size.is_empty() {
+                    format_size(total_size, &g_args.block_size)?
+                } else {
+                    total_size.to_string()
+                };
+                if g_args.summarize {
+                    println!("{:<10} {}", formatted_size, dir);
+                } else if g_args.c && !g_args.summarize || g_args.total {
+                    println!("{:<10} total", formatted_size);
+                } else {
+                    println!("{:<10} {}", formatted_size, dir);
+                }
+            }
+            _ => continue,
+        }
     }
-
     Ok(())
 }
